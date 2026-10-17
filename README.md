@@ -29,7 +29,7 @@
 
 ## Overview
 
-arXiv papers, metadata, and full text from the arXiv API and its OAI-PMH metadata feed. Search papers by query, category, and submission date; fetch structured metadata by ID; and read full paper text with automatic fallback across HTML and PDF renders.
+arXiv papers, metadata, and full text from the arXiv API and its OAI-PMH metadata feed. Search papers by query, category, and submission date; fetch structured metadata by ID; and read full paper text with automatic fallback across HTML and PDF renders. Runs as a stdio process, a local Streamable HTTP server, or the public hosted endpoint above.
 
 ### Tools
 
@@ -53,7 +53,7 @@ arXiv papers, metadata, and full text from the arXiv API and its OAI-PMH metadat
 
 - Field prefixes `ti:`, `au:`, `abs:`, `cat:`, `co:` (comment), `jr:` (journal ref), `all:` (all fields); boolean `AND` / `OR` / `ANDNOT`; query capped at 1000 characters
 - `category` accepts a leaf code (`cs.CL`) or a whole archive (`astro-ph`, `cs`, `math`) — a bare archive matches its subject classes plus pre-subdivision legacy papers
-- `sort_by` (`relevance` / `submitted` / `updated`) and `sort_order` (`ascending` / `descending`); up to 50 results per call — a larger `max_results` returns 50 and the truncation notice names the next `start`
+- `sort_by` (`relevance` / `submitted` / `updated`) and `sort_order` (`ascending` / `descending`); up to 50 results per call — a larger `max_results` returns 50, and the truncation notice names the next `start`, or date windows once paging cannot reach every match
 - arXiv serves only the first 10,000 results of a query, so on a search the live API answers, a page that would cross result 10,000 comes back cut short there with the cut disclosed, and a `start` of 10,000 fails `start_beyond_result_limit` without an arXiv request; a search the local mirror answers serves every `start` up to 10,000
 - `submitted_from` / `submitted_to` bound submission date inclusively (UTC `YYYY-MM-DD`); consecutive windows cover matches with no gap — de-duplicate by ID at the seam — the way to reach results past the first 10,000
 - Response enrichment echoes the effective query (every filter folded in, replayable), total match count, and page offset; empty or overshot pages carry recovery guidance instead of an error
