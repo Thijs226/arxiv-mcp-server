@@ -77,7 +77,8 @@ z.object({
   max_results: z.number().int().min(1).max(10_000).default(10)
     .describe('Maximum results to return. Default 10. At most 50 are returned per call: '
       + 'a larger value returns the first 50, and when more matches exist the response '
-      + 'names the start of the next page. arXiv serves only the first 10000 results '
+      + 'says how to reach them — the start of the next page, or date windows once '
+      + 'paging cannot reach them all. arXiv serves only the first 10000 results '
       + 'of a query, so a page reaching past result 10000 can come back cut short at it, '
       + 'and the response says so. Each result includes title, authors, '
       + 'abstract, and metadata — keep low to manage context budget.'),

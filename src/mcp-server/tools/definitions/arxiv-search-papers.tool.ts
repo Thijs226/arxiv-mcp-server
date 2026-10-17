@@ -24,7 +24,7 @@ const MAX_START = 10_000;
 /**
  * Papers served per call — a response-size choice, not an upstream limit
  * (arXiv answers far larger pages). A larger `max_results` serves this many
- * and the truncation disclosure names the next `start`. See issue #51.
+ * and the truncation disclosure says how to reach the rest. See issue #51.
  */
 const PAGE_CAP = 50;
 
@@ -118,7 +118,7 @@ export const arxivSearchPapers = tool('arxiv_search_papers', {
       .max(MAX_START)
       .default(10)
       .describe(
-        `Maximum results to return. Default 10. At most ${PAGE_CAP} are returned per call: a larger value returns the first ${PAGE_CAP}, and when more matches exist the response names the start of the next page. arXiv serves only the first ${ARXIV_API_RESULT_LIMIT} results of a query, so a page reaching past result ${ARXIV_API_RESULT_LIMIT} can come back cut short at it, and the response says so. Each result includes title, authors, abstract, and metadata — keep low to limit response size.`,
+        `Maximum results to return. Default 10. At most ${PAGE_CAP} are returned per call: a larger value returns the first ${PAGE_CAP}, and when more matches exist the response says how to reach them — the start of the next page, or date windows once paging cannot reach them all. arXiv serves only the first ${ARXIV_API_RESULT_LIMIT} results of a query, so a page reaching past result ${ARXIV_API_RESULT_LIMIT} can come back cut short at it, and the response says so. Each result includes title, authors, abstract, and metadata — keep low to limit response size.`,
       ),
     sort_by: z
       .enum(['relevance', 'submitted', 'updated'])
