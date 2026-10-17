@@ -202,6 +202,13 @@ function buildApiUrl(baseUrl: string, params: Record<string, string>): string {
   return `${baseUrl}/query?${query}`;
 }
 
+/** LaTeXML can serve a conversion failure inside an HTTP 200 HTML page. */
+function hasLatexmlConversionFailure(html: string): boolean {
+  return /<span\b[^>]*\bclass=["'][^"']*\bltx_ERROR\b[^"']*["'][^>]*>\s*Conversion to HTML had a Fatal error and exited abruptly\./i.test(
+    html,
+  );
+}
+
 /**
  * Strip HTML boilerplate (head, site shell, nav chrome) so truncation targets paper content.
  * Tries to find the LaTeXML article element; falls back to stripping just <head>.
@@ -1098,7 +1105,10 @@ export class ArxivService {
         }
         throw serviceUnavailable('arxiv.org HTML network error', { paperId }, { cause: err });
       }
-      if (response.ok) return { content: await response.text(), source: 'arxiv_html' };
+      if (response.ok) {
+        const html = await response.text();
+        if (!hasLatexmlConversionFailure(html)) return { content: html, source: 'arxiv_html' };
+      }
       if (response.status >= 500) {
         // Override 500/501 to ServiceUnavailable so withRetry retries them.
         throw await httpErrorFromResponse(response, {
@@ -1141,7 +1151,10 @@ export class ArxivService {
               )
             : serviceUnavailable('ar5iv network error', { paperId }, { cause: err });
       }
-      if (response?.ok) return { content: await response.text(), source: 'ar5iv' };
+      if (response?.ok) {
+        const html = await response.text();
+        if (!hasLatexmlConversionFailure(html)) return { content: html, source: 'ar5iv' };
+      }
       if (response !== undefined && response.status >= 500) {
         ar5ivFailure = await httpErrorFromResponse(response, {
           service: 'ar5iv',

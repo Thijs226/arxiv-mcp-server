@@ -79,6 +79,15 @@ const ATOM_SPARSE = `<?xml version="1.0" encoding="UTF-8"?>
   </entry>
 </feed>`;
 
+// Failure shape captured from ar5iv's HTTP 200 response for hep-th/9711200v3.
+const LATEXML_FAILURE_HTML = `<html><body><article class="ltx_document">
+        </article>
+      </div>
+      <div class="ltx_document"><div class="ltx_para"><div class="ltx_p"><span class="ltx_ERROR">
+Conversion to HTML had a Fatal error and exited abruptly. This document may be truncated or damaged.
+</span></div></div></div>
+</article></body></html>`;
+
 function atomResponse(xml: string): Response {
   return new Response(xml, {
     status: 200,
@@ -1236,6 +1245,49 @@ describe('ArxivService.readContent', () => {
   // -------------------------------------------------------------------------
   // ar5iv outages fall through to the PDF (issue #38)
   // -------------------------------------------------------------------------
+
+  it('falls through a 200 native HTML conversion failure to ar5iv', async () => {
+    mockFetch
+      .mockResolvedValueOnce(atomResponse(ATOM_SINGLE))
+      .mockResolvedValueOnce(htmlResponse(LATEXML_FAILURE_HTML))
+      .mockResolvedValueOnce(htmlResponse('<article><p>ar5iv paper content</p></article>'));
+
+    const result = await getArxivService().readContent('2401.12345', {}, createMockContext());
+
+    expect(result.source).toBe('ar5iv');
+    expect(result.content).toContain('ar5iv paper content');
+    expect(mockFetch).toHaveBeenCalledTimes(3);
+  });
+
+  it('keeps a genuine paper that mentions a fatal HTML conversion', async () => {
+    mockFetch
+      .mockResolvedValueOnce(atomResponse(ATOM_SINGLE))
+      .mockResolvedValueOnce(new Response('Not Found', { status: 404 }))
+      .mockResolvedValueOnce(
+        htmlResponse(
+          '<article><p>Conversion to HTML had a Fatal error and exited abruptly.</p></article>',
+        ),
+      );
+
+    const result = await getArxivService().readContent('2401.12345', {}, createMockContext());
+
+    expect(result.source).toBe('ar5iv');
+    expect(mockFetch).toHaveBeenCalledTimes(3);
+  });
+
+  it('falls through a 200 ar5iv conversion failure to the PDF (issue #54)', async () => {
+    mockFetch
+      .mockResolvedValueOnce(atomResponse(ATOM_SINGLE))
+      .mockResolvedValueOnce(new Response('Not Found', { status: 404 }))
+      .mockResolvedValueOnce(htmlResponse(LATEXML_FAILURE_HTML))
+      .mockResolvedValueOnce(pdfResponse('Recovered paper text'));
+
+    const result = await getArxivService().readContent('2401.12345', {}, createMockContext());
+
+    expect(result.source).toBe('pdf_text');
+    expect(result.content).toContain('Recovered paper text');
+    expect(mockFetch).toHaveBeenCalledTimes(4);
+  });
 
   it('falls through an ar5iv 502 to the PDF rather than ending the chain', async () => {
     mockFetch
