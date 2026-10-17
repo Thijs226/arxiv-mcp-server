@@ -4,7 +4,7 @@
  */
 
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
-import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
+import { createMockContext, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { arxivGetMetadata } from '@/mcp-server/tools/definitions/arxiv-get-metadata.tool.js';
 import type { PaperLookupResult, PaperMetadata } from '@/services/arxiv/types.js';
@@ -37,14 +37,28 @@ beforeEach(() => {
 
 describe('arxivGetMetadata', () => {
   it('normalizes string input to array', async () => {
+    // The schema takes an array and wraps a lone string into it.
+    mockGetPapers.mockResolvedValue({ papers: [MOCK_PAPER] });
+    const result = await runToolContract(arxivGetMetadata, { paper_ids: '2401.12345' } as never);
+
+    expect(result.isError, JSON.stringify(result)).not.toBe(true);
+    expect(mockGetPapers).toHaveBeenCalledWith(['2401.12345'], expect.anything());
+  });
+
+  it('looks up each ID in canonical form (#41)', async () => {
     mockGetPapers.mockResolvedValue({ papers: [MOCK_PAPER] });
     const ctx = createMockContext({ errors: arxivGetMetadata.errors! }) as Parameters<
       typeof arxivGetMetadata.handler
     >[1];
-    const input = arxivGetMetadata.input.parse({ paper_ids: '2401.12345' });
+    const input = arxivGetMetadata.input.parse({
+      paper_ids: ['arXiv:2401.12345', 'HEP-TH/9901001V2', 'https://arxiv.org/abs/math.GT/0309136'],
+    });
     await arxivGetMetadata.handler(input, ctx);
 
-    expect(mockGetPapers).toHaveBeenCalledWith(['2401.12345'], ctx);
+    expect(mockGetPapers).toHaveBeenCalledWith(
+      ['2401.12345', 'hep-th/9901001v2', 'math/0309136'],
+      ctx,
+    );
   });
 
   it('passes array input directly', async () => {
@@ -63,9 +77,33 @@ describe('arxivGetMetadata', () => {
     const ctx = createMockContext({ errors: arxivGetMetadata.errors! }) as Parameters<
       typeof arxivGetMetadata.handler
     >[1];
-    const input = arxivGetMetadata.input.parse({ paper_ids: '9999.99999' });
+    const input = arxivGetMetadata.input.parse({ paper_ids: ['9999.99999'] });
 
     await expect(arxivGetMetadata.handler(input, ctx)).rejects.toThrow(/not found|no papers/i);
+  });
+
+  it('names the malformed IDs in the no_match message (#41)', async () => {
+    mockGetPapers.mockResolvedValue({
+      papers: [],
+      not_found: [{ id: '9999.99999', reason: 'not_in_arxiv' }],
+    });
+    const ctx = createMockContext({ errors: arxivGetMetadata.errors! }) as Parameters<
+      typeof arxivGetMetadata.handler
+    >[1];
+    const input = arxivGetMetadata.input.parse({ paper_ids: ['9999.99999', 'doi:10.1/x'] });
+
+    await expect(arxivGetMetadata.handler(input, ctx)).rejects.toMatchObject({
+      code: JsonRpcErrorCode.NotFound,
+      data: {
+        reason: 'no_match',
+        not_found: [
+          { id: '9999.99999', reason: 'not_in_arxiv' },
+          expect.objectContaining({ id: 'doi:10.1/x', reason: 'invalid_id' }),
+        ],
+      },
+      message: expect.stringContaining("'doi:10.1/x'"),
+    });
+    expect(mockGetPapers).toHaveBeenCalledWith(['9999.99999'], ctx);
   });
 
   it('fails with version_unavailable, not no_match, when every miss is a mirror version miss (#35)', async () => {
@@ -84,7 +122,7 @@ describe('arxivGetMetadata', () => {
     const ctx = createMockContext({ errors: arxivGetMetadata.errors! }) as Parameters<
       typeof arxivGetMetadata.handler
     >[1];
-    const input = arxivGetMetadata.input.parse({ paper_ids: '1706.03762v7' });
+    const input = arxivGetMetadata.input.parse({ paper_ids: ['1706.03762v7'] });
 
     await expect(arxivGetMetadata.handler(input, ctx)).rejects.toMatchObject({
       code: JsonRpcErrorCode.ServiceUnavailable,
@@ -101,7 +139,7 @@ describe('arxivGetMetadata', () => {
     const ctx = createMockContext({ errors: arxivGetMetadata.errors! }) as Parameters<
       typeof arxivGetMetadata.handler
     >[1];
-    const input = arxivGetMetadata.input.parse({ paper_ids: '9999.99999' });
+    const input = arxivGetMetadata.input.parse({ paper_ids: ['9999.99999'] });
 
     await expect(arxivGetMetadata.handler(input, ctx)).rejects.toMatchObject({
       code: JsonRpcErrorCode.NotFound,
@@ -150,5 +188,96 @@ describe('arxivGetMetadata', () => {
     expect(text).toContain('Found 1 of 3 papers');
     expect(text).toContain('9999.99999 (not_in_arxiv)');
     expect(text).toContain('1706.03762v7 (version_not_in_mirror): Mirror holds version 3.');
+  });
+
+  it('carries remaining_ids and invalid_id entries on both surfaces (#41, #51)', async () => {
+    mockGetPapers.mockResolvedValue({ papers: [MOCK_PAPER] });
+    const ids = Array.from({ length: 11 }, (_, i) => `2401.${String(i + 12345).padStart(5, '0')}`);
+    const result = await runToolContract(arxivGetMetadata, {
+      paper_ids: ['not an id', ...ids],
+    });
+
+    const output = arxivGetMetadata.output.parse(result.structuredContent);
+    expect(output.remaining_ids).toEqual(['2401.12355']);
+    expect(output.not_found).toEqual([
+      expect.objectContaining({ id: 'not an id', reason: 'invalid_id' }),
+    ]);
+    const text = result.content
+      .filter((block) => block.type === 'text')
+      .map((block) => block.text)
+      .join('\n');
+    expect(text).toContain('Found 1 of 2 papers.');
+    expect(text).toContain('- not an id (invalid_id): Not an arXiv ID.');
+    expect(text).toContain(
+      'Remaining IDs (not looked up; pass as paper_ids in the next call): ["2401.12355"]',
+    );
+  });
+
+  it('fails invalid_id without a lookup when no ID is well-formed (#41)', async () => {
+    const ctx = createMockContext({ errors: arxivGetMetadata.errors! }) as Parameters<
+      typeof arxivGetMetadata.handler
+    >[1];
+    const input = arxivGetMetadata.input.parse({ paper_ids: ['doi:10.1/x', '1706.03762 | cs'] });
+
+    await expect(arxivGetMetadata.handler(input, ctx)).rejects.toMatchObject({
+      code: JsonRpcErrorCode.ValidationError,
+      data: { reason: 'invalid_id', ids: ['doi:10.1/x', '1706.03762 | cs'] },
+    });
+    expect(mockGetPapers).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * Per-call thread CPU of `fn`, in ms: the fastest of three samples, each
+ * repeating `fn` until it has used ~20 ms of CPU.
+ */
+function cpuMs(fn: () => unknown): number {
+  let best = Number.POSITIVE_INFINITY;
+  for (let sample = 0; sample < 3; sample++) {
+    const start = process.threadCpuUsage();
+    let calls = 0;
+    let usedMs = 0;
+    do {
+      fn();
+      calls++;
+      const used = process.threadCpuUsage(start);
+      usedMs = (used.user + used.system) / 1000;
+    } while (usedMs < 20);
+    best = Math.min(best, usedMs / calls);
+  }
+  return best;
+}
+
+/**
+ * Assert a `paper_ids` parse stays linear on `make(size)` as `size` doubles from
+ * 5k to 320k characters. Each size must meet an absolute CPU bound before the
+ * next runs, so a superlinear cost fails at the first doubling it outgrows; the
+ * full 64× span must cost under 256× (a quadratic costs ~4,096×).
+ */
+function expectLinear(make: (size: number) => string): void {
+  const times: number[] = [];
+  for (let size = 5_000; size <= 320_000; size *= 2) {
+    const paper_ids = make(size);
+    const ms = cpuMs(() => arxivGetMetadata.input.safeParse({ paper_ids }));
+    expect(ms, `${size} characters took ${ms.toFixed(3)} ms`).toBeLessThan(2 + size / 2_000);
+    times.push(ms);
+  }
+  expect((times.at(-1) ?? 0) / (times[0] ?? 1)).toBeLessThan(256);
+}
+
+// The bound is thread CPU; the wall-clock timeout only has to outlast a loaded machine.
+describe('arxivGetMetadata paper_ids parse cost on caller-sized input', { timeout: 30_000 }, () => {
+  // A lone string is trimmed and scanned for a list separator before it is
+  // wrapped or refused; both outcomes stay within the linear bound.
+  it('keeps the parse of a lone string it wraps linear in input length', () => {
+    const make = (size: number) => 'a'.repeat(size);
+    expect(arxivGetMetadata.input.safeParse({ paper_ids: make(5_000) }).success).toBe(true);
+    expectLinear(make);
+  });
+
+  it('keeps the parse of a lone string it refuses linear in input length', () => {
+    const make = (size: number) => `${' \t'.repeat(size / 2)}x\n${' '.repeat(size / 2)}y`;
+    expect(arxivGetMetadata.input.safeParse({ paper_ids: make(5_000) }).success).toBe(false);
+    expectLinear(make);
   });
 });

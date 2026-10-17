@@ -14,7 +14,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { paperResource } from '@/mcp-server/resources/definitions/paper.resource.js';
 import { arxivGetMetadata } from '@/mcp-server/tools/definitions/arxiv-get-metadata.tool.js';
 import { arxivReadPaper } from '@/mcp-server/tools/definitions/arxiv-read-paper.tool.js';
-import { arxivSearch } from '@/mcp-server/tools/definitions/arxiv-search.tool.js';
+import { arxivSearchPapers } from '@/mcp-server/tools/definitions/arxiv-search-papers.tool.js';
 import { getArxivService, initArxivService } from '@/services/arxiv/arxiv-service.js';
 
 vi.mock('@/config/server-config.js', () => ({
@@ -52,7 +52,7 @@ async function softThrottleErrorData(): Promise<Record<string, unknown>> {
 }
 
 const definitions = [
-  { name: 'arxiv_search', errors: arxivSearch.errors },
+  { name: 'arxiv_search_papers', errors: arxivSearchPapers.errors },
   { name: 'arxiv_get_metadata', errors: arxivGetMetadata.errors },
   { name: 'arxiv_read_paper', errors: arxivReadPaper.errors },
   { name: 'arxiv://paper/{paperId}', errors: paperResource.errors },

@@ -10,7 +10,7 @@ import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { arxivGetMetadata } from '@/mcp-server/tools/definitions/arxiv-get-metadata.tool.js';
 import { arxivReadPaper } from '@/mcp-server/tools/definitions/arxiv-read-paper.tool.js';
-import { arxivSearch } from '@/mcp-server/tools/definitions/arxiv-search.tool.js';
+import { arxivSearchPapers } from '@/mcp-server/tools/definitions/arxiv-search-papers.tool.js';
 import type { PaperContent, PaperLookupResult, SearchResult } from '@/services/arxiv/types.js';
 
 vi.mock('@/services/arxiv/arxiv-service.js', () => ({
@@ -54,24 +54,24 @@ beforeEach(() => {
 });
 
 // ---------------------------------------------------------------------------
-// Query injection via arxiv_search
+// Query injection via arxiv_search_papers
 // ---------------------------------------------------------------------------
 
-describe('arxivSearch — injection and oversized inputs', () => {
+describe('arxivSearchPapers — injection and oversized inputs', () => {
   it('schema rejects query with null byte (C0 control char)', () => {
-    expect(() => arxivSearch.input.parse({ query: 'valid\x00query' })).toThrow();
+    expect(() => arxivSearchPapers.input.parse({ query: 'valid\x00query' })).toThrow();
   });
 
   it('schema rejects query with STX control char', () => {
-    expect(() => arxivSearch.input.parse({ query: '\x02bad' })).toThrow();
+    expect(() => arxivSearchPapers.input.parse({ query: '\x02bad' })).toThrow();
   });
 
   it('schema rejects query at 1001 chars (one over max)', () => {
-    expect(() => arxivSearch.input.parse({ query: 'q'.repeat(1001) })).toThrow();
+    expect(() => arxivSearchPapers.input.parse({ query: 'q'.repeat(1001) })).toThrow();
   });
 
   it('schema accepts query at exactly 1000 chars (boundary)', () => {
-    expect(() => arxivSearch.input.parse({ query: 'q'.repeat(1000) })).not.toThrow();
+    expect(() => arxivSearchPapers.input.parse({ query: 'q'.repeat(1000) })).not.toThrow();
   });
 
   it('query-injection payload reaches the service as a plain string — no shell interpretation', async () => {
@@ -79,12 +79,12 @@ describe('arxivSearch — injection and oversized inputs', () => {
     // transformation that could cause injection in the URL layer. The query is
     // passed verbatim and the service (mocked) receives it literally.
     mockSearch.mockResolvedValue(MOCK_SEARCH_RESULT);
-    const ctx = createMockContext({ errors: arxivSearch.errors! }) as Parameters<
-      typeof arxivSearch.handler
+    const ctx = createMockContext({ errors: arxivSearchPapers.errors! }) as Parameters<
+      typeof arxivSearchPapers.handler
     >[1];
     const injection = 'au:alice"; DROP TABLE papers; --';
-    const input = arxivSearch.input.parse({ query: injection });
-    await arxivSearch.handler(input, ctx);
+    const input = arxivSearchPapers.input.parse({ query: injection });
+    await arxivSearchPapers.handler(input, ctx);
 
     // The service received the query exactly as provided — no mutation that
     // could silently drop or alter the injection string.
@@ -97,7 +97,7 @@ describe('arxivSearch — injection and oversized inputs', () => {
     vi.stubEnv('ARXIV_API_BASE_URL', sentinel);
 
     try {
-      const result = arxivSearch.format?.({ papers: [] }) ?? [];
+      const result = arxivSearchPapers.format?.({ papers: [] }) ?? [];
       const text = (result[0] as { text: string }).text;
       expect(text).not.toContain(sentinel);
     } finally {
@@ -107,48 +107,28 @@ describe('arxivSearch — injection and oversized inputs', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Oversized inputs for arxiv_get_metadata
+// Malformed inputs for arxiv_get_metadata (the 100-ID ceiling is pinned in
+// input-validation.test.ts)
 // ---------------------------------------------------------------------------
 
-describe('arxivGetMetadata — injection and oversized inputs', () => {
-  it('schema rejects more than 10 IDs in the batch array', () => {
-    const ids = Array.from({ length: 11 }, (_, i) => `2401.${String(i).padStart(5, '0')}`);
-    expect(() => arxivGetMetadata.input.parse({ paper_ids: ids })).toThrow();
-  });
-
+describe('arxivGetMetadata — injection and malformed inputs', () => {
   it('schema rejects empty string ID in the array', () => {
     expect(() => arxivGetMetadata.input.parse({ paper_ids: ['2401.12345', ''] })).toThrow();
   });
 
-  it('IDs with path-traversal characters pass schema but arrive at service unmodified', async () => {
-    // arxiv_get_metadata accepts free-form ID strings (no path normalization);
-    // actual validation happens at the arXiv API. We verify the ID is not
-    // silently mutated by the handler layer.
-    mockGetPapers.mockResolvedValue({
-      papers: [
-        {
-          id: '2401.12345v1',
-          title: 'Test',
-          authors: ['A'],
-          abstract: 'ab',
-          primary_category: 'cs.AI',
-          categories: ['cs.AI'],
-          published: '2024-01-22T00:00:00Z',
-          updated: '2024-01-22T00:00:00Z',
-          pdf_url: 'https://arxiv.org/pdf/2401.12345v1',
-          abstract_url: 'https://arxiv.org/abs/2401.12345v1',
-        },
-      ],
-    });
+  it('IDs with path-traversal characters fail invalid_id and never reach the service', async () => {
+    // Every ID runs through the arXiv ID parser before any lookup (#41), so a
+    // path-traversal string is rejected locally instead of riding to arXiv.
     const ctx = createMockContext({ errors: arxivGetMetadata.errors! }) as Parameters<
       typeof arxivGetMetadata.handler
     >[1];
     const suspiciousId = '../../../etc/passwd';
-    const input = arxivGetMetadata.input.parse({ paper_ids: suspiciousId });
-    await arxivGetMetadata.handler(input, ctx);
+    const input = arxivGetMetadata.input.parse({ paper_ids: [suspiciousId] });
 
-    // Handler calls service with the ID as-is; arXiv API will reject it.
-    expect(mockGetPapers).toHaveBeenCalledWith([suspiciousId], ctx);
+    await expect(arxivGetMetadata.handler(input, ctx)).rejects.toMatchObject({
+      data: { reason: 'invalid_id', ids: [suspiciousId] },
+    });
+    expect(mockGetPapers).not.toHaveBeenCalled();
   });
 });
 

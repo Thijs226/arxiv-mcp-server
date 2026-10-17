@@ -11,7 +11,7 @@
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { arxivSearch } from '@/mcp-server/tools/definitions/arxiv-search.tool.js';
+import { arxivSearchPapers } from '@/mcp-server/tools/definitions/arxiv-search-papers.tool.js';
 import { initArxivService } from '@/services/arxiv/arxiv-service.js';
 
 vi.mock('@/config/server-config.js', () => ({
@@ -68,7 +68,7 @@ function emptyFeed(): Response {
  */
 describe('argument rejection envelope', () => {
   it('names the omitted required field on both surfaces', async () => {
-    const result = await runToolContract(arxivSearch, {} as never);
+    const result = await runToolContract(arxivSearchPapers, {} as never);
 
     expect(result.isError).toBe(true);
     const error = errorOf(result);
@@ -83,7 +83,7 @@ describe('argument rejection envelope', () => {
   it('names the wrongly-typed field on both surfaces', async () => {
     // A boolean, not an integer: the framework repairs an integer sent for a
     // string field into its digits before validation.
-    const result = await runToolContract(arxivSearch, { query: true } as never);
+    const result = await runToolContract(arxivSearchPapers, { query: true } as never);
 
     expect(result.isError).toBe(true);
     expect(errorOf(result).code).toBe(JsonRpcErrorCode.InvalidParams);
@@ -94,7 +94,7 @@ describe('argument rejection envelope', () => {
   it('drops a client-injected root key instead of rejecting the call', async () => {
     mockFetch.mockResolvedValue(emptyFeed());
 
-    const result = await runToolContract(arxivSearch, {
+    const result = await runToolContract(arxivSearchPapers, {
       query: 'all:test',
       toolCallId: 'call_abc123',
       _meta: { progressToken: 1 },
@@ -106,7 +106,7 @@ describe('argument rejection envelope', () => {
   it('rewrites a case-style spelling of a declared key onto the declared one', async () => {
     mockFetch.mockResolvedValue(emptyFeed());
 
-    const result = await runToolContract(arxivSearch, {
+    const result = await runToolContract(arxivSearchPapers, {
       query: 'all:test',
       maxResults: 3,
     } as never);
@@ -123,7 +123,7 @@ describe('domain failure envelope', () => {
       new Response('Rate exceeded.', { status: 200, headers: { 'content-type': 'text/plain' } }),
     );
 
-    const result = await runToolContract(arxivSearch, { query: 'all:test' });
+    const result = await runToolContract(arxivSearchPapers, { query: 'all:test' });
 
     expect(result.isError).toBe(true);
     const error = errorOf(result);

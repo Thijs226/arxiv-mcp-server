@@ -6,14 +6,15 @@
 import { resource, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { getArxivService } from '@/services/arxiv/arxiv-service.js';
+import { normalizePaperId, PAPER_ID_FORMS } from '@/services/arxiv/paper-id.js';
 
 /**
  * Percent-decode a URI-template variable. Template matching yields the raw text
  * of the URI segment, so a client that encodes the ID — mandatory for legacy IDs
  * such as `hep-th/9901001`, whose slash cannot appear literally inside a single
- * `{paperId}` segment — would otherwise have the escapes reach arXiv verbatim.
- * A malformed escape sequence is left untouched so it fails the empty-ID check
- * or the arXiv lookup rather than throwing an unclassified `URIError`.
+ * `{paperId}` segment — would otherwise have its ID rejected for the escapes in it.
+ * A malformed escape sequence is left untouched so it fails the empty-ID or
+ * ID-format check rather than throwing an unclassified `URIError`.
  */
 function decodeUriSegment(raw: string): string {
   try {
@@ -32,7 +33,9 @@ export const paperResource = resource('arxiv://paper/{paperId}', {
       .string()
       .trim()
       .min(1, 'Paper ID cannot be empty. Provide an arXiv ID (e.g., "2401.12345").')
-      .describe('arXiv paper ID (e.g., "2401.12345" or "2401.12345v2").'),
+      .describe(
+        'arXiv paper ID: "2401.12345", "2401.12345v2", or a pre-2007 ID like "hep-th/9901001" (archive spelled as arXiv issued it) with its slash percent-encoded, optionally prefixed "arXiv:".',
+      ),
   }),
 
   errors: [
@@ -43,11 +46,18 @@ export const paperResource = resource('arxiv://paper/{paperId}', {
       recovery: 'Supply a non-blank arXiv ID such as "2401.12345" and read the URI again.',
     },
     {
+      reason: 'invalid_id',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'The decoded paper ID is not an arXiv identifier in an accepted form.',
+      recovery:
+        'Read the URI with an ID like "2401.12345", "2401.12345v2", or "hep-th/9901001" (a pre-2007 archive spelled as arXiv issued it; percent-encode the slash).',
+    },
+    {
       reason: 'no_match',
       code: JsonRpcErrorCode.NotFound,
       when: 'Paper ID is not present in the arXiv index.',
       recovery:
-        'Verify the paper ID format (e.g., "2401.12345") and confirm the paper exists via arxiv_search.',
+        'Verify the paper ID format (e.g., "2401.12345") and confirm the paper exists via arxiv_search_papers.',
     },
     {
       reason: 'version_unavailable',
@@ -68,7 +78,7 @@ export const paperResource = resource('arxiv://paper/{paperId}', {
     {
       reason: 'invalid_request',
       code: JsonRpcErrorCode.InvalidRequest,
-      when: 'arXiv rejected the request (HTTP 4xx other than 429), e.g. malformed ID syntax.',
+      when: 'arXiv rejected the request (HTTP 4xx other than 429).',
       recovery: 'Verify the paper ID format (e.g., "2401.12345") and retry.',
       thrownBy: 'service',
     },
@@ -80,10 +90,16 @@ export const paperResource = resource('arxiv://paper/{paperId}', {
     // text — `%20` is three ordinary characters to it. Decode first, then
     // re-apply the blank check so an encoded blank is rejected here instead of
     // consuming an arXiv request slot.
-    const paperId = decodeUriSegment(params.paperId).trim();
-    if (!paperId) {
+    const decoded = decodeUriSegment(params.paperId).trim();
+    if (!decoded) {
       throw ctx.fail('empty_id', `Paper ID '${params.paperId}' is blank once decoded.`, {
         paperId: params.paperId,
+      });
+    }
+    const paperId = normalizePaperId(decoded);
+    if (!paperId) {
+      throw ctx.fail('invalid_id', `'${decoded}' is not an arXiv ID. Use ${PAPER_ID_FORMS}.`, {
+        paperId: decoded,
       });
     }
 

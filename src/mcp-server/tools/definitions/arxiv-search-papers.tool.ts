@@ -1,26 +1,38 @@
 /**
- * @fileoverview arxiv_search tool — search arXiv papers by query with category and sort filters.
- * @module mcp-server/tools/definitions/arxiv-search
+ * @fileoverview arxiv_search_papers tool — search arXiv papers by query with category and sort filters.
+ * @module mcp-server/tools/definitions/arxiv-search-papers
  */
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { getArxivService } from '@/services/arxiv/arxiv-service.js';
-import { formatPaper, PaperMetadataSchema } from '@/services/arxiv/types.js';
+import {
+  ARXIV_API_RESULT_LIMIT,
+  formatPaper,
+  PaperMetadataSchema,
+} from '@/services/arxiv/types.js';
 
 /**
- * Deepest pagination offset arXiv serves — it answers HTTP 500 beyond this, so
- * the cap is a real upstream boundary rather than a policy choice. Shared by the
- * `start` schema and the truncation guidance, which has to know when "page
- * further" stops being an executable instruction. See issues #2 and #27.
+ * Deepest pagination offset the schema accepts. arXiv's API serves only its
+ * first {@link ARXIV_API_RESULT_LIMIT} results, so on the live path the service
+ * cuts a page at that limit and refuses a start at it; the local mirror has no
+ * such limit and serves every start up to this one. Shared by the `start`
+ * schema and the mirror's truncation guidance. See issues #2, #27, and #56.
  */
 const MAX_START = 10_000;
+
+/**
+ * Papers served per call — a response-size choice, not an upstream limit
+ * (arXiv answers far larger pages). A larger `max_results` serves this many
+ * and the truncation disclosure names the next `start`. See issue #51.
+ */
+const PAGE_CAP = 50;
 
 /** Optional `YYYY-MM-DD`. Empty string passes so form-based clients that submit
  * the whole schema shape aren't punished; the handler treats it as unset. */
 const OPTIONAL_DATE = /^(\d{4}-\d{2}-\d{2})?$/;
 
-export const arxivSearch = tool('arxiv_search', {
+export const arxivSearchPapers = tool('arxiv_search_papers', {
   description:
     'Search arXiv papers by query with category and sort filters. Returns paper metadata including title, authors, abstract, categories, and links.',
   annotations: { readOnlyHint: true },
@@ -66,6 +78,13 @@ export const arxivSearch = tool('arxiv_search', {
         'Give both bounds as real UTC calendar dates in YYYY-MM-DD form, with submitted_from on or before submitted_to.',
       thrownBy: 'service',
     },
+    {
+      reason: 'start_beyond_result_limit',
+      code: JsonRpcErrorCode.ValidationError,
+      when: `start is ${ARXIV_API_RESULT_LIMIT} or more on a search arXiv answers, past the first ${ARXIV_API_RESULT_LIMIT} results it serves for any query.`,
+      recovery: `arXiv serves results 1-${ARXIV_API_RESULT_LIMIT} of a query, so use a start below ${ARXIV_API_RESULT_LIMIT}; to reach later matches, split the search into submitted_from/submitted_to date windows and page within each.`,
+      thrownBy: 'service',
+    },
   ],
 
   input: z.object({
@@ -96,10 +115,10 @@ export const arxivSearch = tool('arxiv_search', {
       .number()
       .int()
       .min(1)
-      .max(50)
+      .max(MAX_START)
       .default(10)
       .describe(
-        'Maximum results to return (1-50). Default 10. Each result includes title, authors, abstract, and metadata — keep low to limit response size.',
+        `Maximum results to return. Default 10. At most ${PAGE_CAP} are returned per call: a larger value returns the first ${PAGE_CAP}, and when more matches exist the response names the start of the next page. arXiv serves only the first ${ARXIV_API_RESULT_LIMIT} results of a query, so a page reaching past result ${ARXIV_API_RESULT_LIMIT} can come back cut short at it, and the response says so. Each result includes title, authors, abstract, and metadata — keep low to limit response size.`,
       ),
     sort_by: z
       .enum(['relevance', 'submitted', 'updated'])
@@ -121,7 +140,7 @@ export const arxivSearch = tool('arxiv_search', {
       )
       .default(0)
       .describe(
-        `Pagination offset (0-${MAX_START}). Use with max_results to page through results. E.g., start=10 with max_results=10 returns results 11-20. Matches beyond offset ${MAX_START} + max_results are unreachable by paging — carve the search into submitted_from/submitted_to windows and page within each.`,
+        `Pagination offset (0-${MAX_START}). Use with max_results to page through results. E.g., start=10 with max_results=10 returns results 11-20. arXiv serves only the first ${ARXIV_API_RESULT_LIMIT} results of a query, so a page reaching past result ${ARXIV_API_RESULT_LIMIT} can come back cut short at it and a start of ${ARXIV_API_RESULT_LIMIT} can be refused. To reach later matches, carve the search into submitted_from/submitted_to windows and page within each.`,
       ),
     submitted_from: z
       .string()
@@ -162,7 +181,12 @@ export const arxivSearch = tool('arxiv_search', {
         'True when more matching papers exist beyond this page (totalFound > start + shown).',
       ),
     shown: z.number().optional().describe('Papers returned on this page.'),
-    cap: z.number().optional().describe('The max_results limit applied to this page.'),
+    cap: z
+      .number()
+      .optional()
+      .describe(
+        `The page size applied: max_results, or ${PAGE_CAP} when max_results asks for more — fewer when the page was cut short at result ${ARXIV_API_RESULT_LIMIT}, the last one arXiv serves.`,
+      ),
     notice: z
       .string()
       .optional()
@@ -179,6 +203,7 @@ export const arxivSearch = tool('arxiv_search', {
 
   async handler(input, ctx) {
     const service = getArxivService();
+    const pageSize = Math.min(input.max_results, PAGE_CAP);
     // Empty strings arrive from form-based clients that submit the whole schema
     // shape; treat them as unset rather than as a window nobody asked for.
     const result = await service.search(
@@ -187,7 +212,7 @@ export const arxivSearch = tool('arxiv_search', {
         ...(input.category && { category: input.category }),
         ...(input.submitted_from && { submittedFrom: input.submitted_from }),
         ...(input.submitted_to && { submittedTo: input.submitted_to }),
-        maxResults: input.max_results,
+        maxResults: pageSize,
         sortBy: input.sort_by,
         sortOrder: input.sort_order,
         start: input.start,
@@ -211,17 +236,24 @@ export const arxivSearch = tool('arxiv_search', {
     });
 
     // Disclose when this page was capped — more matches exist past start + shown.
-    // Past the offset ceiling "page further" stops being an executable
-    // instruction, so the guidance names the date-window mechanism instead.
+    // Past the reachable bound "page further" stops being an executable
+    // instruction, so the guidance names the date-window mechanism instead. On
+    // the live path the bound is arXiv's result limit, where the service also
+    // cut this page short; the mirror's bound is the deepest start plus a page.
+    const limit = result.result_limit;
     if (result.papers.length > 0 && result.total_results > result.start + result.papers.length) {
       const nextStart = result.start + result.papers.length;
-      const reachable = MAX_START + input.max_results;
+      const reachable = limit ?? MAX_START + pageSize;
+      const unreachable =
+        limit === undefined
+          ? `only the first ${reachable} are reachable by paging (start caps at ${MAX_START})`
+          : `arXiv serves only the first ${limit} results of a query`;
       ctx.enrich.truncated({
         shown: result.papers.length,
-        cap: input.max_results,
+        cap: limit === undefined ? pageSize : Math.min(pageSize, limit - result.start),
         guidance:
           result.total_results > reachable
-            ? `${result.total_results} total matches, but only the first ${reachable} are reachable by paging (start caps at ${MAX_START}). Split the search into submitted_from/submitted_to date windows and page within each — both bounds are inclusive, so consecutive windows cover every match with no gap; de-duplicate by paper id, since one submitted exactly at a window seam appears in both.`
+            ? `${result.total_results} total matches, but ${unreachable}. Split the search into submitted_from/submitted_to date windows and page within each — both bounds are inclusive, so consecutive windows cover every match with no gap; de-duplicate by paper id, since one submitted exactly at a window seam appears in both.`
             : `${result.total_results} total matches. Page further with start=${nextStart}, or refine the query.`,
       });
     }

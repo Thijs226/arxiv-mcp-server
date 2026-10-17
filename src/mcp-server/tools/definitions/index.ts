@@ -6,10 +6,10 @@
 import { arxivGetMetadata } from './arxiv-get-metadata.tool.js';
 import { arxivListCategories } from './arxiv-list-categories.tool.js';
 import { arxivReadPaper } from './arxiv-read-paper.tool.js';
-import { arxivSearch } from './arxiv-search.tool.js';
+import { arxivSearchPapers } from './arxiv-search-papers.tool.js';
 
 export const allToolDefinitions = [
-  arxivSearch,
+  arxivSearchPapers,
   arxivGetMetadata,
   arxivReadPaper,
   arxivListCategories,

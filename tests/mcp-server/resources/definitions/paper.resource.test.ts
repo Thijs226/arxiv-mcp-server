@@ -80,15 +80,32 @@ describe('paperResource', () => {
   });
 
   it('passes a malformed escape through rather than throwing a URIError', async () => {
+    // The undecodable text reaches the ID parser as written and fails it (#41)
+    // without an arXiv lookup.
     mockGetPapers.mockResolvedValue({ papers: [] });
     const ctx = createMockContext({ errors: paperResource.errors! }) as Parameters<
       typeof paperResource.handler
     >[1];
 
     await expect(paperResource.handler({ paperId: '%zz' }, ctx)).rejects.toMatchObject({
-      data: { reason: 'no_match' },
+      code: JsonRpcErrorCode.ValidationError,
+      data: { reason: 'invalid_id', paperId: '%zz' },
     });
-    expect(mockGetPapers).toHaveBeenCalledWith(['%zz'], ctx);
+    expect(mockGetPapers).not.toHaveBeenCalled();
+  });
+
+  it('looks up a prefixed or subject-class paperId in canonical form (#41)', async () => {
+    mockGetPapers.mockResolvedValue({ papers: [MOCK_PAPER] });
+    const ctx = createMockContext({ errors: paperResource.errors! }) as Parameters<
+      typeof paperResource.handler
+    >[1];
+
+    await paperResource.handler({ paperId: 'arXiv%3A2401.12345' }, ctx);
+    await paperResource.handler({ paperId: 'math.GT%2F0309136' }, ctx);
+    expect(mockGetPapers.mock.calls).toEqual([
+      [['2401.12345'], ctx],
+      [['math/0309136'], ctx],
+    ]);
   });
 
   it('throws when paper not found', async () => {
