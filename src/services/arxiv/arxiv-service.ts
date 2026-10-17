@@ -771,14 +771,20 @@ export class ArxivService {
     // Built before the path split so the mirror echoes the same string the live
     // API would have received — one definition of "what was actually searched".
     const searchQuery = buildSearchQuery(query, options);
+    // The mirror's answer, or `undefined` when it is not ready or the query's
+    // free-text term is over its match cap — a query over the cap never falls
+    // back to it, so the cap bounds every mirror search.
+    const fromMirror = async () => {
+      const ready = await tryReadyMirror(ctx);
+      return ready && this.searchMirror(ready.store, query, searchQuery, options, ctx);
+    };
 
     // Mirror path: enabled, harvest complete, the query isn't sort-by-recent
     // (which needs the up-to-the-minute live API to cover the nightly gap), and
     // its free-text term is narrow enough for the mirror to count and rank.
     const bypassForRecency = shouldBypassForRecency(options, config.mirrorRecentDaysLive);
     if (!bypassForRecency) {
-      const ready = await tryReadyMirror(ctx);
-      const mirrored = ready && this.searchMirror(ready.store, query, searchQuery, options, ctx);
+      const mirrored = await fromMirror();
       if (mirrored) return mirrored;
     }
 
@@ -787,8 +793,7 @@ export class ArxivService {
     // goes out. Under the recency bypass the mirror still serves such a page.
     const start = options.start ?? 0;
     if (start >= ARXIV_API_RESULT_LIMIT) {
-      const ready = bypassForRecency ? await tryReadyMirror(ctx) : undefined;
-      const mirrored = ready && this.searchMirror(ready.store, query, searchQuery, options, ctx);
+      const mirrored = bypassForRecency ? await fromMirror() : undefined;
       if (mirrored) return mirrored;
       throw validationError(
         `start ${start} is past the matches arXiv serves: its API returns only the first ${ARXIV_API_RESULT_LIMIT} results of a query, so start must be below ${ARXIV_API_RESULT_LIMIT}.`,
@@ -829,10 +834,7 @@ export class ArxivService {
       // A cancelled call is over: answering it from the mirror would turn the
       // caller's cancellation into a success nobody is waiting for.
       if (!bypassForRecency || ctx.signal.aborted) throw err;
-      const ready = await tryReadyMirror(ctx);
-      // A query over the mirror's match cap never falls back to it, so the cap
-      // bounds every mirror search.
-      const mirrored = ready && this.searchMirror(ready.store, query, searchQuery, options, ctx);
+      const mirrored = await fromMirror();
       if (!mirrored) throw err;
       ctx.log.warning('Live API failed on recency bypass; answered from mirror', {
         error: err instanceof Error ? err.message : String(err),
