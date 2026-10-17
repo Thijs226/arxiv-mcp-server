@@ -48,9 +48,23 @@ export interface SearchResult {
    */
   effective_query: string;
   papers: PaperMetadata[];
+  /**
+   * How many leading matches the backend that answered can serve: set on the
+   * live path to {@link ARXIV_API_RESULT_LIMIT}, where a page crossing it is cut
+   * short. Absent on the mirror, which serves any offset.
+   */
+  result_limit?: number;
   start: number;
   total_results: number;
 }
+
+/**
+ * arXiv's API serves only the first 10,000 results of a query: a request whose
+ * `start + max_results` passes it answers HTTP 500, whatever the total. Verified
+ * live — `start=9990&max_results=10` answers 200, `max_results=11` answers 500,
+ * as does `start=10000&max_results=1`. See issue #56.
+ */
+export const ARXIV_API_RESULT_LIMIT = 10_000;
 
 /**
  * Why a requested ID returned no metadata. The tool layer advertises these
@@ -61,9 +75,11 @@ export interface SearchResult {
  * - `version_not_in_mirror` — the paper exists and the local mirror holds it,
  *   but at a different version, and live fallback is disabled. The ID is
  *   unreachable in this configuration, not absent from arXiv. See issue #35.
+ * - `invalid_id` — the input is not an arXiv identifier in any accepted
+ *   spelling, so it was never looked up. See issue #41.
  */
 export const PaperNotFoundReasonSchema = z
-  .enum(['not_in_arxiv', 'version_not_in_mirror'])
+  .enum(['not_in_arxiv', 'version_not_in_mirror', 'invalid_id'])
   .describe('Why the paper ID could not be returned.');
 
 export type PaperNotFoundReason = z.infer<typeof PaperNotFoundReasonSchema>;
@@ -111,10 +127,51 @@ export interface ReadContentOptions {
   start?: number;
 }
 
+/** One sectioning heading of a paper body, located by its offset in the cleaned body. */
+export const OutlineEntrySchema = z
+  .object({
+    level: z
+      .number()
+      .int()
+      .describe(
+        'Heading depth from its tag number minus one: h2 = 1, h3 = 2, and so on to h6 = 5.',
+      ),
+    title: z
+      .string()
+      .describe(
+        'Heading text with markup removed, e.g. "3.1 Encoder and Decoder Stacks"; cut at 120 characters.',
+      ),
+    start: z
+      .number()
+      .int()
+      .describe('Offset of the heading in the cleaned body. Pass as start to read from it.'),
+  })
+  .describe(
+    'A part, chapter, section, subsection, subsubsection, paragraph, appendix, or bibliography heading.',
+  );
+
+export type OutlineEntry = z.infer<typeof OutlineEntrySchema>;
+
 export interface PaperContent {
   abstract_url: string;
   body_characters: number;
   content: string;
+  /**
+   * Sectioning headings of the cleaned body, in document order. Present only
+   * on a read from `start` 0; empty for `pdf_text`, whose text carries no
+   * reliable headings.
+   */
+  outline?: OutlineEntry[];
+  /**
+   * Offset of the first heading left out of `outline` when its shallowest level
+   * alone passes the entry cap and is cut there. Present only on such a cut.
+   */
+  outline_continues_at?: number;
+  /**
+   * Heading levels left out of `outline` to keep it within its entry cap,
+   * deepest first. Present only when levels were dropped.
+   */
+  outline_omitted_levels?: number[];
   paper_id: string;
   pdf_url: string;
   source: PaperContentSource;

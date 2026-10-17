@@ -11,7 +11,7 @@ import { join } from 'node:path';
 import { runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { resetServerConfig } from '@/config/server-config.js';
-import { arxivSearch } from '@/mcp-server/tools/definitions/arxiv-search.tool.js';
+import { arxivSearchPapers } from '@/mcp-server/tools/definitions/arxiv-search-papers.tool.js';
 import { initArxivService } from '@/services/arxiv/arxiv-service.js';
 import { MirrorStore, resetStore } from '@/services/arxiv/mirror/store.js';
 import type { ArxivRawRecord } from '@/services/arxiv/mirror/types.js';
@@ -52,6 +52,19 @@ const records: ArxivRawRecord[] = [
     abstract: 'Attention models for vision.',
     categories: 'cs.CV',
     versions: [{ version: 'v1', date: '2024-01-20T00:00:00.000Z' }],
+  },
+  {
+    // Text that reads as a number must keep its spelling on both paths (#45).
+    paper_id: '2401.10004',
+    identifier: 'oai:arXiv.org:2401.10004',
+    datestamp: '2024-01-12',
+    title: 'Numeric Comment Fields',
+    authors: 'Erin Example',
+    abstract: 'Notes with numeric metadata.',
+    categories: 'math.NT',
+    comments: '1.10',
+    journal_ref: '007',
+    versions: [{ version: 'v1', date: '2024-01-12T00:00:00.000Z' }],
   },
 ];
 
@@ -121,6 +134,7 @@ describe('mirror and live search contract parity', () => {
     { query: 'all:"dark matter"', expectedQuery: 'all:"dark matter"', ids: [1] },
     { query: 'all:convergence', expectedQuery: 'all:convergence', ids: [0] },
     { query: 'jr:Learning', expectedQuery: 'jr:Learning', ids: [0] },
+    { query: 'au:erin', expectedQuery: 'au:erin', ids: [3] },
     {
       query: 'ti:transformer',
       category: 'cs',
@@ -142,16 +156,46 @@ describe('mirror and live search contract parity', () => {
       max_results: 1,
     },
     { query: 'ti:transformer', expectedQuery: 'ti:transformer', ids: [0, 2], max_results: 1 },
-    { query: 'ti:transformer', expectedQuery: 'ti:transformer', ids: [0, 2], start: 10_000 },
+    // Past the per-call cap both paths serve 50 (#51).
+    { query: 'ti:transformer', expectedQuery: 'ti:transformer', ids: [0, 2], max_results: 200 },
+    // The deepest full page arXiv serves: start + max_results = 10,000 (#56).
+    { query: 'ti:transformer', expectedQuery: 'ti:transformer', ids: [0, 2], start: 9_990 },
     { query: 'ti:unfindable', expectedQuery: 'ti:unfindable', ids: [] },
   ];
+
+  // Issue #56: past arXiv's 10,000-result limit the two paths part ways — the
+  // live path refuses before any request, the mirror keeps serving the page.
+  it('refuses start=10000 on the live path without a request, while the mirror serves it', async () => {
+    const input = { query: 'ti:transformer', start: 10_000 };
+    const fetch = vi.fn();
+    vi.stubGlobal('fetch', fetch);
+    const live = await runToolContract(arxivSearchPapers, input);
+    expect(live.isError).toBe(true);
+    expect(fetch).not.toHaveBeenCalled();
+    expect(
+      (live.structuredContent as { error: { data: { reason: string } } }).error.data.reason,
+    ).toBe('start_beyond_result_limit');
+
+    vi.stubEnv('ARXIV_MIRROR_ENABLED', 'true');
+    resetServerConfig();
+    initArxivService();
+    const mirror = await runToolContract(arxivSearchPapers, input);
+    expect(mirror.isError, JSON.stringify(mirror)).not.toBe(true);
+    expect(fetch).not.toHaveBeenCalled();
+    expect(mirror.structuredContent).toMatchObject({
+      papers: [],
+      totalFound: 2,
+      pageStart: 10_000,
+      notice: 'Offset 10000 exceeds total results (2). Last valid page starts at 1.',
+    });
+  });
 
   for (const example of cases) {
     it(`${example.query}, start=${example.start ?? 0}, limit=${example.max_results ?? 10}`, async () => {
       const { ids, expectedQuery, ...args } = example;
       const input = { ...args, sort_by: 'submitted' as const, sort_order: 'ascending' as const };
       const start = example.start ?? 0;
-      const limit = example.max_results ?? 10;
+      const limit = Math.min(example.max_results ?? 10, 50);
       const page = ids.slice(start, start + limit).map((index) => records[index]!);
       const fetch = vi.fn(async (request: string | URL | Request) => {
         const url = new URL(request instanceof Request ? request.url : String(request));
@@ -174,19 +218,19 @@ describe('mirror and live search contract parity', () => {
         );
       });
       vi.stubGlobal('fetch', fetch);
-      const live = await runToolContract(arxivSearch, input);
+      const live = await runToolContract(arxivSearchPapers, input);
       expect(live.isError, JSON.stringify(live)).not.toBe(true);
       expect(fetch).toHaveBeenCalledTimes(1);
 
       vi.stubEnv('ARXIV_MIRROR_ENABLED', 'true');
       resetServerConfig();
       initArxivService();
-      const mirror = await runToolContract(arxivSearch, input);
+      const mirror = await runToolContract(arxivSearchPapers, input);
       expect(mirror.isError, JSON.stringify(mirror)).not.toBe(true);
       expect(fetch).toHaveBeenCalledTimes(1);
       expect(mirror.structuredContent).toEqual(live.structuredContent);
       expect(mirror.content).toEqual(live.content);
-      const papers = arxivSearch.output.parse(mirror.structuredContent).papers;
+      const papers = arxivSearchPapers.output.parse(mirror.structuredContent).papers;
       expect(papers.map((paper) => paper.id)).toEqual(
         page.map((record) => `${record.paper_id}${record.versions.at(-1)!.version}`),
       );

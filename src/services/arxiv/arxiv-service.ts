@@ -41,20 +41,23 @@ import {
 import {
   expandCategoryOperands,
   getStore,
+  MIRROR_SEARCH_MATCH_CAP,
   type MirrorStore,
   openStore,
   type PaperRow,
   translateQuery,
 } from './mirror/index.js';
-import type {
-  PaperContent,
-  PaperContentSource,
-  PaperLookupMiss,
-  PaperLookupResult,
-  PaperMetadata,
-  ReadContentOptions,
-  SearchOptions,
-  SearchResult,
+import {
+  ARXIV_API_RESULT_LIMIT,
+  type OutlineEntry,
+  type PaperContent,
+  type PaperContentSource,
+  type PaperLookupMiss,
+  type PaperLookupResult,
+  type PaperMetadata,
+  type ReadContentOptions,
+  type SearchOptions,
+  type SearchResult,
 } from './types.js';
 
 // ---------------------------------------------------------------------------
@@ -203,13 +206,26 @@ function buildApiUrl(baseUrl: string, params: Record<string, string>): string {
 }
 
 /**
- * Strip HTML boilerplate (head, site shell, nav chrome) so truncation targets paper content.
- * Tries to find the LaTeXML article element; falls back to stripping just <head>.
+ * Strip HTML boilerplate (head, site shell, nav chrome, site footer) so
+ * truncation targets paper content. Tries to find the LaTeXML article element;
+ * falls back to stripping just <head>.
+ *
+ * The article runs to the last `</article>`, tag kept: everything after it is
+ * the site footer on both HTML rungs (build-log links, logos, error-reporting
+ * instructions, scripts), while appendices and the bibliography sit inside it.
+ * See issue #43.
  */
-function stripHtmlHead(html: string): string {
-  // Best: find <article> which wraps the actual paper in arXiv/ar5iv HTML
-  const articleMatch = html.match(/<article\b[^>]*>/i);
-  if (articleMatch) return html.slice(html.indexOf(articleMatch[0]));
+export function stripHtmlHead(html: string): string {
+  // Best: find <article> which wraps the actual paper in arXiv/ar5iv HTML. An
+  // opener counts once a `>` follows it: one literal search plus one `>`
+  // lookup, linear in page length. See issue #52.
+  const articleStart = html.search(/<article\b/i);
+  if (articleStart !== -1 && html.indexOf('>', articleStart) !== -1) {
+    const articleClose = html.lastIndexOf('</article>');
+    return articleClose > articleStart
+      ? html.slice(articleStart, articleClose + '</article>'.length)
+      : html.slice(articleStart);
+  }
 
   // Fallback: find LaTeXML page main content
   const ltxMain = html.match(/<div\s+class="ltx_page_main"/i);
@@ -224,12 +240,39 @@ function stripHtmlHead(html: string): string {
   return html.slice(bodyStart);
 }
 
+/** The notice LaTeXML leaves in a page whose conversion aborted. */
+const CONVERSION_FAILURE_NOTICE = 'Conversion to HTML had a Fatal error';
+/** An `ltx_ERROR` span and its text — the span ar5iv writes the notice into. */
+const ERROR_SPAN = /<span class="ltx_ERROR\b[^"<>]*">([^<]*)<\/span>/g;
+
+/**
+ * Whether an HTML page is a converter's failure notice rather than a render:
+ * the article carries LaTeXML's fatal-error notice and no other text. ar5iv
+ * answers an aborted conversion with HTTP 200 and an empty `<article>` followed
+ * by the notice; a partial render that keeps the notice beside paper text, or a
+ * paper whose prose quotes it, still counts as a render. See issue #54.
+ *
+ * Only a page holding the notice is scanned further. The `ltx_ERROR` span that
+ * carries the notice is dropped, then every tag, and whatever text is left is
+ * paper content. Each span scan and each tag scan stops at the next `<`, so the
+ * check stays linear in page length.
+ */
+export function isConversionFailurePage(html: string): boolean {
+  if (!html.includes(CONVERSION_FAILURE_NOTICE)) return false;
+  const text = stripHtmlHead(html)
+    .replace(ERROR_SPAN, (span, spanText: string) =>
+      spanText.includes(CONVERSION_FAILURE_NOTICE) ? '' : span,
+    )
+    .replace(/<[^<>]*>/g, '');
+  return !/\S/.test(text);
+}
+
 /**
  * Class tokens that mark document structure (sections, headings, bibliography,
  * abstract, etc.). The `ltx_*` classes generally carry no information a reader
- * benefits from, but these specific tokens identify section boundaries and are
- * worth preserving so future tooling (e.g. section-scoped reads) can navigate
- * the paper without re-fetching from upstream.
+ * benefits from, but these specific tokens identify section boundaries: the
+ * outline (`buildOutline`) reads them from the cleaned body, and a caller can
+ * navigate the paper by them without re-fetching from upstream.
  */
 const LATEXML_STRUCTURAL_CLASS =
   /\bltx_(?:section|subsection|subsubsection|paragraph|subparagraph|appendix|bibliography|abstract|acknowledgements?|title|part|chapter)\b/;
@@ -249,19 +292,69 @@ const LATEXML_STRUCTURAL_CLASS =
  *
  * HTML entities (`&lt;`, `&gt;`, `&amp;`) in the LaTeX source are decoded so the
  * downstream consumer sees the raw TeX literally.
+ *
+ * A single forward pass: an element runs from `<math` to the first `>` and on to
+ * the first `</math>` after it, and the scan resumes past that closer. An opener
+ * with no `>` or no closer after it means none of the later ones has either, so
+ * the pass stops there and leaves the rest as written. Linear in page length.
+ * See issue #52.
  */
-function collapseMathML(html: string): string {
-  return html.replace(/<math\b([^>]*)>([\s\S]*?)<\/math>/g, (_, attrs: string, inner: string) => {
-    const block = /\bdisplay=["']block["']/i.test(attrs);
-    const annot = inner.match(
-      /<annotation[^>]*encoding=["']application\/x-tex["'][^>]*>([\s\S]*?)<\/annotation>/,
-    )?.[1];
-    const alt = attrs.match(/\balttext=["']([^"']*)["']/)?.[1];
-    const tex = annot ?? alt;
-    if (!tex) return '';
-    const decoded = tex.replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
-    return block ? `$$${decoded}$$` : `$${decoded}$`;
-  });
+export function collapseMathML(html: string): string {
+  const parts: string[] = [];
+  let copied = 0;
+  let from = 0;
+  for (;;) {
+    const open = html.indexOf('<math', from);
+    if (open === -1) break;
+    const attrsStart = open + '<math'.length;
+    if (/\w/.test(html.charAt(attrsStart))) {
+      from = attrsStart; // `<mathvariant`, not a <math> element
+      continue;
+    }
+    const tagEnd = html.indexOf('>', attrsStart);
+    if (tagEnd === -1) break;
+    const close = html.indexOf('</math>', tagEnd + 1);
+    if (close === -1) break;
+    parts.push(
+      html.slice(copied, open),
+      mathToTex(html.slice(attrsStart, tagEnd), html.slice(tagEnd + 1, close)),
+    );
+    copied = from = close + '</math>'.length;
+  }
+  parts.push(html.slice(copied));
+  return parts.join('');
+}
+
+/** The TeX one `<math>` element collapses to, from its attributes and inner markup. */
+function mathToTex(attrs: string, inner: string): string {
+  const block = /\bdisplay=["']block["']/i.test(attrs);
+  const tex = texAnnotation(inner) ?? attrs.match(/\balttext=["']([^"']*)["']/)?.[1];
+  if (!tex) return '';
+  const decoded = tex.replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
+  return block ? `$$${decoded}$$` : `$${decoded}$`;
+}
+
+const TEX_ENCODING = /encoding=["']application\/x-tex["']/;
+
+/**
+ * Content of the first `<annotation …encoding="application/x-tex"…>` in `inner`,
+ * up to its `</annotation>`. Forward pass on the same terms as `collapseMathML`:
+ * an opener whose tag lacks the x-tex encoding is skipped past its `>` (any
+ * opener inside that tag sees a suffix of it, so it lacks the encoding too).
+ */
+function texAnnotation(inner: string): string | undefined {
+  let from = 0;
+  for (;;) {
+    const open = inner.indexOf('<annotation', from);
+    if (open === -1) return;
+    const tagEnd = inner.indexOf('>', open + '<annotation'.length);
+    if (tagEnd === -1) return;
+    if (TEX_ENCODING.test(inner.slice(open + '<annotation'.length, tagEnd))) {
+      const close = inner.indexOf('</annotation>', tagEnd + 1);
+      return close === -1 ? undefined : inner.slice(tagEnd + 1, close);
+    }
+    from = tagEnd + 1;
+  }
 }
 
 /**
@@ -275,17 +368,168 @@ function collapseMathML(html: string): string {
  * Exception: class attributes containing a structural marker (see
  * LATEXML_STRUCTURAL_CLASS) are preserved verbatim so section boundaries remain
  * identifiable for downstream tooling.
+ *
+ * The class and id passes start a match only at the first character of a
+ * whitespace run (`(?<!\s)`), which keeps them linear in page length. The
+ * leftmost match already starts there, so the output is the same either way.
+ * See issue #52.
  */
-function stripLatexmlNoise(html: string): string {
+export function stripLatexmlNoise(html: string): string {
   return (
     collapseMathML(html)
-      .replace(/\s+class="(ltx_[^"]*)"/gi, (match, value) =>
+      .replace(/(?<!\s)\s+class="(ltx_[^"]*)"/gi, (match, value) =>
         LATEXML_STRUCTURAL_CLASS.test(value) ? match : '',
       )
-      .replace(/\s+id="[^"]*"/gi, '')
+      .replace(/(?<!\s)\s+id="[^"]*"/gi, '')
       // Collapse runs of 2+ <br> tags (LaTeXML emits these around display math)
       .replace(/(?:<br\s*\/?>\s*){2,}/gi, '<br>\n')
   );
+}
+
+/** A URL that names its own scheme (`https:`, `mailto:`) — already absolute. */
+const URL_SCHEME = /^[a-zA-Z][a-zA-Z\d+.-]*:/;
+
+/**
+ * Rewrite each relative `src`, `href`, and `data` value to an absolute URL,
+ * resolved against `baseUrl` — the URL that served the page — the way a browser
+ * resolves it. LaTeXML figure paths are relative to the page
+ * (`1706.03762v7/Figures/x.png` on arxiv.org, `/html/1706.03762/assets/x.png` on
+ * ar5iv), so a caller holding only the body cannot fetch them. Fragment links
+ * (`#bib.bib13`) stay as written: they read as citation and section keys, not
+ * anything fetchable. See issue #43.
+ *
+ * `<[a-zA-Z][^<>]*>` stops each tag scan at the next `<` or `>`, so tag scans
+ * never overlap and the pass stays linear in body length.
+ */
+export function resolveRelativeUrls(html: string, baseUrl: string): string {
+  return html.replace(/<[a-zA-Z][^<>]*>/g, (tag) =>
+    tag.replace(/(\s(?:src|href|data)=")([^"]*)"/g, (attr, prefix: string, value: string) => {
+      if (value === '' || value.startsWith('#') || URL_SCHEME.test(value)) return attr;
+      const resolved = URL.parse(value, baseUrl);
+      return resolved ? `${prefix}${resolved.href}"` : attr;
+    }),
+  );
+}
+
+/** Most entries an outline carries; past it, the deepest heading levels are dropped whole. */
+const OUTLINE_MAX_ENTRIES = 200;
+/** Longest outline title, in characters. */
+const OUTLINE_TITLE_MAX = 120;
+/** Longest heading markup read for a title; a longer span is a heading that never closes. */
+const HEADING_SOURCE_MAX = 4000;
+
+/** A cleaned LaTeXML heading opener — `stripLatexmlNoise` leaves exactly `<hN class="…">`. */
+const HEADING_OPENER = /<h([1-6]) class="([^"<>]{1,200})">/y;
+/** Heading classes that mark document structure; theorem, proof, abstract, and contents titles do not. */
+const OUTLINE_HEADING_CLASS =
+  /\bltx_title_(?:part|chapter|section|subsection|subsubsection|paragraph|appendix|bibliography)\b/;
+
+const NAMED_CHARACTER_REFERENCES: Record<string, string> = {
+  amp: '&',
+  apos: "'",
+  gt: '>',
+  lt: '<',
+  nbsp: '\u00a0',
+  quot: '"',
+};
+
+function decodeCharacterReferences(text: string): string {
+  return text.replace(
+    /&(?:#(\d{1,7})|#[xX]([\da-fA-F]{1,6})|([a-zA-Z]+));/g,
+    (ref, dec?: string, hex?: string, name?: string) => {
+      if (name) return NAMED_CHARACTER_REFERENCES[name] ?? ref;
+      const code = dec ? Number.parseInt(dec, 10) : Number.parseInt(hex ?? '', 16);
+      return code <= 0x10ffff ? String.fromCodePoint(code) : ref;
+    },
+  );
+}
+
+/**
+ * An HTML tag: a name, then attributes after whitespace. Collapsed TeX keeps its
+ * `<` and `>` raw (`$0<h<1$`, `$a<b$ and $c>d$`), and none of it reads as a tag.
+ */
+const HTML_TAG = /<\/?[a-zA-Z][\w-]*(?:\s[^<>]*)?\/?>/g;
+/** A heading opener tag, `<h1`–`<h6` then whitespace or `>`. */
+const HEADING_TAG = /<h[1-6][\s>]/g;
+
+/** Heading markup to its title: tags stripped, references decoded, whitespace collapsed. */
+function headingTitle(markup: string): string {
+  const text = decodeCharacterReferences(markup.replace(HTML_TAG, ' ')).replace(/\s+/g, ' ').trim();
+  return text.length > OUTLINE_TITLE_MAX ? `${text.slice(0, OUTLINE_TITLE_MAX - 1)}…` : text;
+}
+
+/**
+ * Section outline of a cleaned HTML body: each part, chapter, section,
+ * subsection, subsubsection, paragraph, appendix, and bibliography heading, in
+ * document order, with the offset of its `<hN` tag. `level` follows the tag
+ * (h2 = 1), not the class — a paper with no `\section` renders its subsections
+ * as `<h2>`. Past `OUTLINE_MAX_ENTRIES`, the deepest level is dropped whole until
+ * the rest fit, and the dropped levels are returned. The shallowest level is
+ * never dropped: when it alone passes the cap, its first `OUTLINE_MAX_ENTRIES`
+ * entries are kept and `continuesAt` is the offset of the first one left out.
+ * See issue #44.
+ *
+ * One forward pass. Each candidate `<h` is matched against a bounded sticky
+ * opener, and the closer lookup is cached — a heading's closer is the first
+ * `</h` after its content, which later headings reuse until they pass it — so
+ * the scan stays linear in body length.
+ */
+export function buildOutline(body: string): {
+  continuesAt?: number;
+  entries: OutlineEntry[];
+  omittedLevels: number[];
+} {
+  let entries: OutlineEntry[] = [];
+  let close = -1;
+  let pos = 0;
+  for (;;) {
+    pos = body.indexOf('<h', pos);
+    if (pos === -1) break;
+    HEADING_OPENER.lastIndex = pos;
+    const opener = HEADING_OPENER.exec(body);
+    if (!opener?.[1] || !OUTLINE_HEADING_CLASS.test(opener[2] ?? '')) {
+      pos += 2;
+      continue;
+    }
+    const contentStart = pos + opener[0].length;
+    if (close < contentStart) {
+      close = body.indexOf('</h', contentStart);
+      if (close === -1) break; // nothing after this point closes a heading
+    }
+    // A heading whose span holds another heading tag never closed; that one takes the closer.
+    HEADING_TAG.lastIndex = contentStart;
+    const nextOpener = HEADING_TAG.exec(body)?.index ?? -1;
+    if (
+      close - contentStart <= HEADING_SOURCE_MAX &&
+      (nextOpener === -1 || nextOpener > close) &&
+      body.startsWith(`</h${opener[1]}>`, close)
+    ) {
+      entries.push({
+        level: Number(opener[1]) - 1,
+        title: headingTitle(body.slice(contentStart, close)),
+        start: pos,
+      });
+    }
+    if (nextOpener === -1) break;
+    pos = nextOpener;
+  }
+
+  const omittedLevels: number[] = [];
+  const shallowest = Math.min(...entries.map((entry) => entry.level));
+  while (entries.length > OUTLINE_MAX_ENTRIES) {
+    const deepest = entries.reduce((max, entry) => Math.max(max, entry.level), 0);
+    const firstLeftOut = entries[OUTLINE_MAX_ENTRIES];
+    if (deepest === shallowest && firstLeftOut) {
+      return {
+        entries: entries.slice(0, OUTLINE_MAX_ENTRIES),
+        omittedLevels,
+        continuesAt: firstLeftOut.start,
+      };
+    }
+    omittedLevels.push(deepest);
+    entries = entries.filter((entry) => entry.level < deepest);
+  }
+  return { entries, omittedLevels };
 }
 
 function stripVersion(id: string): string {
@@ -493,6 +737,10 @@ export class ArxivService {
     this.parser = new XMLParser({
       ignoreAttributes: false,
       attributeNamePrefix: '@_',
+      // Element text stays the upstream string: a title of "1.10" or a comment
+      // of "0" is text, not a number to re-spell or drop. The mirror harvester
+      // parses with the same setting. See issue #45.
+      parseTagValue: false,
       isArray: (_name, jpath) =>
         typeof jpath === 'string' &&
         ['feed.entry', 'feed.entry.author', 'feed.entry.category', 'feed.entry.link'].includes(
@@ -524,20 +772,34 @@ export class ArxivService {
     // API would have received — one definition of "what was actually searched".
     const searchQuery = buildSearchQuery(query, options);
 
-    // Mirror path: enabled, harvest complete, and the query isn't sort-by-recent
-    // (which needs the up-to-the-minute live API to cover the nightly gap).
+    // Mirror path: enabled, harvest complete, the query isn't sort-by-recent
+    // (which needs the up-to-the-minute live API to cover the nightly gap), and
+    // its free-text term is narrow enough for the mirror to count and rank.
     const bypassForRecency = shouldBypassForRecency(options, config.mirrorRecentDaysLive);
     if (!bypassForRecency) {
       const ready = await tryReadyMirror(ctx);
-      if (ready) {
-        return this.searchMirror(ready.store, query, searchQuery, options, ctx);
-      }
+      const mirrored = ready && this.searchMirror(ready.store, query, searchQuery, options, ctx);
+      if (mirrored) return mirrored;
+    }
+
+    // arXiv answers HTTP 500 to any request reaching past its result limit, so a
+    // page is cut at the limit and a start with nothing left before it never
+    // goes out. Under the recency bypass the mirror still serves such a page.
+    const start = options.start ?? 0;
+    if (start >= ARXIV_API_RESULT_LIMIT) {
+      const ready = bypassForRecency ? await tryReadyMirror(ctx) : undefined;
+      const mirrored = ready && this.searchMirror(ready.store, query, searchQuery, options, ctx);
+      if (mirrored) return mirrored;
+      throw validationError(
+        `start ${start} is past the matches arXiv serves: its API returns only the first ${ARXIV_API_RESULT_LIMIT} results of a query, so start must be below ${ARXIV_API_RESULT_LIMIT}.`,
+        { start, resultLimit: ARXIV_API_RESULT_LIMIT, reason: 'start_beyond_result_limit' },
+      );
     }
 
     const url = buildApiUrl(config.apiBaseUrl, {
       search_query: searchQuery,
-      start: String(options.start ?? 0),
-      max_results: String(options.maxResults ?? 10),
+      start: String(start),
+      max_results: String(Math.min(options.maxResults ?? 10, ARXIV_API_RESULT_LIMIT - start)),
       sortBy: SORT_BY_MAP[options.sortBy ?? 'relevance'] ?? 'relevance',
       sortOrder: options.sortOrder ?? 'descending',
     });
@@ -552,6 +814,7 @@ export class ArxivService {
             start: feed.startIndex,
             papers: feed.entries,
             effective_query: searchQuery,
+            result_limit: ARXIV_API_RESULT_LIMIT,
           };
         },
         {
@@ -563,13 +826,18 @@ export class ArxivService {
         },
       );
     } catch (err) {
-      if (!bypassForRecency) throw err;
+      // A cancelled call is over: answering it from the mirror would turn the
+      // caller's cancellation into a success nobody is waiting for.
+      if (!bypassForRecency || ctx.signal.aborted) throw err;
       const ready = await tryReadyMirror(ctx);
-      if (!ready) throw err;
-      ctx.log.warning('Live API failed on recency bypass; falling back to mirror', {
+      // A query over the mirror's match cap never falls back to it, so the cap
+      // bounds every mirror search.
+      const mirrored = ready && this.searchMirror(ready.store, query, searchQuery, options, ctx);
+      if (!mirrored) throw err;
+      ctx.log.warning('Live API failed on recency bypass; answered from mirror', {
         error: err instanceof Error ? err.message : String(err),
       });
-      return this.searchMirror(ready.store, query, searchQuery, options, ctx);
+      return mirrored;
     }
   }
 
@@ -627,6 +895,12 @@ export class ArxivService {
    * the live path would. The mirror's own translator understands every operand
    * that string can contain (`cat:` subtree wildcards, `submittedDate:[…]`), so
    * replaying the echo through `query` selects the same rows.
+   *
+   * Returns `undefined`, without searching, when the query's free-text term
+   * matches at least {@link MIRROR_SEARCH_MATCH_CAP} papers — the caller answers
+   * it from the live API instead, whose total is arXiv's own exact count. Only a
+   * free-text term is probed; a category- or date-only search keeps its
+   * index-backed mirror path (#19, #49).
    */
   private searchMirror(
     store: MirrorStore,
@@ -634,7 +908,7 @@ export class ArxivService {
     effectiveQuery: string,
     options: SearchOptions,
     ctx: Context,
-  ): SearchResult {
+  ): SearchResult | undefined {
     const translated = translateQuery(query);
     const categoryGroups = [
       translated.categoryFilters,
@@ -653,6 +927,14 @@ export class ArxivService {
     let papers: PaperRow[];
     let total: number;
     try {
+      if (translated.matchExpr !== undefined && store.matchReachesCap(translated.matchExpr)) {
+        ctx.log.info('Mirror search term reaches the match cap; using live API', {
+          query,
+          matchExpr: translated.matchExpr,
+          cap: MIRROR_SEARCH_MATCH_CAP,
+        });
+        return;
+      }
       ({ papers, total } = store.search({
         ...(translated.matchExpr !== undefined && { matchExpr: translated.matchExpr }),
         categoryGroups,
@@ -825,7 +1107,7 @@ export class ArxivService {
 
     // Body fetch with its own retry (2s base delay for heavier pages).
     // Same fail-fast-on-rate-limit policy as API calls — see isArxivTransient.
-    const { content, source } = await withRetry(() => this.fetchBody(paper, ctx), {
+    const { content, source, url } = await withRetry(() => this.fetchBody(paper, ctx), {
       operation: 'arxivFetchBody',
       context: ctx as unknown as RequestContext,
       signal: ctx.signal,
@@ -834,14 +1116,17 @@ export class ArxivService {
       baseDelayMs: 2000,
     });
 
-    // HTML sources: strip <head> / site chrome, then strip LaTeXML class/id
-    // noise so max_characters buys real body content, not `ltx_text` wrappers.
-    // PDF-extracted text carries neither, so it passes through untouched and
-    // total_characters equals body_characters.
+    // HTML sources: cut to the article (dropping <head>, site chrome, and the
+    // site footer), strip LaTeXML class/id noise so max_characters buys real
+    // body content, not `ltx_text` wrappers, then make relative links absolute.
+    // PDF-extracted text carries none of these, so it passes through untouched
+    // and total_characters equals body_characters.
     const isHtmlSource = source !== 'pdf_text';
     const bodyContent = isHtmlSource ? stripHtmlHead(content) : content;
     const totalCharacters = bodyContent.length;
-    const cleaned = isHtmlSource ? stripLatexmlNoise(bodyContent) : bodyContent;
+    const cleaned = isHtmlSource
+      ? resolveRelativeUrls(stripLatexmlNoise(bodyContent), url)
+      : bodyContent;
     const bodyCharacters = cleaned.length;
 
     const start = options.start ?? 0;
@@ -851,6 +1136,14 @@ export class ArxivService {
     // is past bodyCharacters, sliced is empty and truncated is false — the
     // caller paged off the end.
     const truncated = start + sliced.length < bodyCharacters;
+    // The outline rides the first page only: a caller jumping to a known start
+    // already holds it. PDF text carries no reliable headings, so it gets none.
+    const outline =
+      start !== 0
+        ? undefined
+        : isHtmlSource
+          ? buildOutline(cleaned)
+          : { entries: [], omittedLevels: [] };
 
     return {
       paper_id: paper.id,
@@ -863,6 +1156,11 @@ export class ArxivService {
       body_characters: bodyCharacters,
       pdf_url: paper.pdf_url,
       abstract_url: paper.abstract_url,
+      ...(outline ? { outline: outline.entries } : {}),
+      ...(outline && outline.omittedLevels.length > 0
+        ? { outline_omitted_levels: outline.omittedLevels }
+        : {}),
+      ...(outline?.continuesAt !== undefined ? { outline_continues_at: outline.continuesAt } : {}),
     };
   }
 
@@ -1066,11 +1364,14 @@ export class ArxivService {
    * LaTeXML, so a submission whose LaTeX breaks one usually breaks the other and
    * they fail together. The PDF is the one artifact arXiv publishes for every
    * paper, which makes it the fallback that actually widens coverage. See #23.
+   *
+   * `url` is the URL that served the body — `response.url`, which follows any
+   * redirect — and is the base relative links in an HTML body resolve against.
    */
   private async fetchBody(
     paper: PaperMetadata,
     ctx: Context,
-  ): Promise<{ content: string; source: PaperContentSource }> {
+  ): Promise<{ content: string; source: PaperContentSource; url: string }> {
     const config = getServerConfig();
     const paperId = paper.id;
     // Pass the paperId through verbatim — both arxiv.org/html and ar5iv honor a
@@ -1081,9 +1382,10 @@ export class ArxivService {
     // Try native arXiv HTML first
     {
       const signal = AbortSignal.any([ctx.signal, AbortSignal.timeout(config.contentTimeoutMs)]);
+      const url = `https://arxiv.org/html/${paperId}`;
       let response: Response;
       try {
-        response = await fetch(`https://arxiv.org/html/${paperId}`, {
+        response = await fetch(url, {
           signal,
           headers: { 'user-agent': USER_AGENT, accept: 'text/html' },
         });
@@ -1098,7 +1400,13 @@ export class ArxivService {
         }
         throw serviceUnavailable('arxiv.org HTML network error', { paperId }, { cause: err });
       }
-      if (response.ok) return { content: await response.text(), source: 'arxiv_html' };
+      if (response.ok) {
+        return {
+          content: await response.text(),
+          source: 'arxiv_html',
+          url: response.url || url,
+        };
+      }
       if (response.status >= 500) {
         // Override 500/501 to ServiceUnavailable so withRetry retries them.
         throw await httpErrorFromResponse(response, {
@@ -1112,6 +1420,9 @@ export class ArxivService {
 
     /**
      * Fallback to ar5iv — don't follow redirects (307 = paper not converted).
+     * A 200 carrying only the converter's fatal-error notice is no render
+     * either (`isConversionFailurePage`); arxiv.org/html answers the same
+     * failure with a 404, so the first rung needs no such check. See #54.
      *
      * A failure of this rung never ends the chain. ar5iv is a third-party
      * LaTeXML conversion service; whether it is up says nothing about whether
@@ -1123,9 +1434,10 @@ export class ArxivService {
     let ar5ivFailure: McpError | undefined;
     {
       const signal = AbortSignal.any([ctx.signal, AbortSignal.timeout(config.contentTimeoutMs)]);
+      const url = `https://ar5iv.labs.arxiv.org/html/${paperId}`;
       let response: Response | undefined;
       try {
-        response = await fetch(`https://ar5iv.labs.arxiv.org/html/${paperId}`, {
+        response = await fetch(url, {
           signal,
           redirect: 'manual',
           headers: { 'user-agent': USER_AGENT, accept: 'text/html' },
@@ -1141,7 +1453,13 @@ export class ArxivService {
               )
             : serviceUnavailable('ar5iv network error', { paperId }, { cause: err });
       }
-      if (response?.ok) return { content: await response.text(), source: 'ar5iv' };
+      if (response?.ok) {
+        const content = await response.text();
+        if (!isConversionFailurePage(content)) {
+          return { content, source: 'ar5iv', url: response.url || url };
+        }
+        ctx.log.debug('ar5iv served a conversion-failure page; trying the PDF', { paperId });
+      }
       if (response !== undefined && response.status >= 500) {
         ar5ivFailure = await httpErrorFromResponse(response, {
           service: 'ar5iv',
@@ -1149,13 +1467,13 @@ export class ArxivService {
             s >= 500 && s < 600 ? JsonRpcErrorCode.ServiceUnavailable : undefined,
         });
       }
-      // 3xx or 4xx → not converted. Either way, on to the PDF.
+      // 3xx, 4xx, or a 200 conversion-failure page → not converted. On to the PDF.
     }
 
     // Last rung: the PDF, extracted to plain text.
     const pdfText = await this.fetchPdfText(paper, ctx);
     if (pdfText !== undefined && pdfText.trim() !== '') {
-      return { content: pdfText, source: 'pdf_text' };
+      return { content: pdfText, source: 'pdf_text', url: paper.pdf_url };
     }
     // The PDF did not cover for ar5iv, so report what ar5iv did rather than a
     // verdict about the paper's artifacts that ar5iv never answered.

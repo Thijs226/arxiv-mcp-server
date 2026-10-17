@@ -4,10 +4,23 @@
  * @module services/arxiv/arxiv-service.test
  */
 
+import { createHash } from 'node:crypto';
+import { readFileSync } from 'node:fs';
+import { gunzipSync } from 'node:zlib';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
-import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
+import { createMockContext, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { getArxivService, initArxivService } from '@/services/arxiv/arxiv-service.js';
+import { arxivSearchPapers } from '@/mcp-server/tools/definitions/arxiv-search-papers.tool.js';
+import {
+  buildOutline,
+  collapseMathML,
+  getArxivService,
+  initArxivService,
+  isConversionFailurePage,
+  resolveRelativeUrls,
+  stripHtmlHead,
+  stripLatexmlNoise,
+} from '@/services/arxiv/arxiv-service.js';
 import { PaperMetadataSchema } from '@/services/arxiv/types.js';
 
 vi.mock('@/config/server-config.js', () => ({
@@ -91,6 +104,73 @@ function htmlResponse(html: string): Response {
     status: 200,
     headers: { 'content-type': 'text/html; charset=UTF-8' },
   });
+}
+
+/**
+ * An HTML page as served from `url`. `new Response()` leaves `url` empty, so the
+ * served-URL base the service resolves relative links against is set by hand.
+ */
+function servedPage(html: string, url: string): Response {
+  const response = htmlResponse(html);
+  Object.defineProperty(response, 'url', { value: url });
+  return response;
+}
+
+/**
+ * A captured arXiv HTML page from `tests/fixtures/arxiv-html/` (gzipped). The
+ * `-headings` captures keep every heading of the article but none of its
+ * paragraphs; the rest keep the whole article and the site footer after it.
+ */
+function fixturePage(name: string): string {
+  const path = new URL(`../../fixtures/arxiv-html/${name}.html.gz`, import.meta.url);
+  return gunzipSync(readFileSync(path)).toString('utf8');
+}
+
+/** Single-entry Atom feed for an arbitrary versioned paper ID. */
+function atomFor(versionedId: string): string {
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom"
+      xmlns:opensearch="http://a9.com/-/spec/opensearch/1.1/"
+      xmlns:arxiv="http://arxiv.org/schemas/atom">
+  <opensearch:totalResults>1</opensearch:totalResults>
+  <opensearch:startIndex>0</opensearch:startIndex>
+  <entry>
+    <id>http://arxiv.org/abs/${versionedId}</id>
+    <title>Fixture ${versionedId}</title><summary>x</summary>
+    <author><name>X</name></author>
+    <published>2020-01-01T00:00:00Z</published><updated>2020-01-01T00:00:00Z</updated>
+  </entry>
+</feed>`;
+}
+
+/**
+ * Serve fixture page `name` for `versionedId` on the requested HTML rung and
+ * read it back through the real cleaning pipeline.
+ */
+async function readFixture(
+  versionedId: string,
+  name: string,
+  rung: 'arxiv_html' | 'ar5iv',
+  options: { maxCharacters?: number | null; start?: number } = { maxCharacters: null },
+) {
+  mockFetch.mockResolvedValueOnce(atomResponse(atomFor(versionedId)));
+  if (rung === 'ar5iv') {
+    mockFetch
+      .mockResolvedValueOnce(new Response('Not Found', { status: 404 }))
+      .mockResolvedValueOnce(
+        servedPage(fixturePage(name), `https://ar5iv.labs.arxiv.org/html/${versionedId}`),
+      );
+  } else {
+    mockFetch.mockResolvedValueOnce(
+      servedPage(fixturePage(name), `https://arxiv.org/html/${versionedId}`),
+    );
+  }
+  return getArxivService().readContent(versionedId, options, createMockContext());
+}
+
+/** Every value of `attr="…"` in `html`, in document order. */
+function attrValues(html: string, attr: string): string[] {
+  return [...html.matchAll(new RegExp(`\\s${attr}="([^"]*)"`, 'g'))].map((m) => m[1] ?? '');
 }
 
 /**
@@ -706,6 +786,167 @@ describe('ArxivService.search', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Issue #56 — arXiv serves only the first 10,000 results of a query: a request
+// whose start + max_results passes 10,000 answers HTTP 500, whatever the total.
+// ---------------------------------------------------------------------------
+
+describe('ArxivService.search — the 10,000-result limit (#56)', () => {
+  /** Requests the fake API received, as [start, max_results]. */
+  let requests: Array<[number, number]>;
+
+  /**
+   * A fake arXiv query endpoint holding `total` matches that, like the real one,
+   * answers HTTP 500 to any request reaching past result 10,000.
+   */
+  function fakeArxiv(total: number) {
+    requests = [];
+    mockFetch.mockImplementation(async (input) => {
+      const params = new URL(String(input)).searchParams;
+      const start = Number(params.get('start'));
+      const max = Number(params.get('max_results'));
+      requests.push([start, max]);
+      if (start + max > 10_000) return new Response('internal error', { status: 500 });
+      const count = Math.max(0, Math.min(max, total - start));
+      const entries = Array.from(
+        { length: count },
+        (_, i) => `<entry>
+    <id>http://arxiv.org/abs/2401.${String(start + i).padStart(5, '0')}v1</id>
+    <title>Result ${start + i + 1}</title><summary>x</summary>
+    <author><name>X</name></author>
+    <published>2020-01-01T00:00:00Z</published><updated>2020-01-01T00:00:00Z</updated>
+  </entry>`,
+      ).join('\n');
+      return atomResponse(`<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom" xmlns:opensearch="http://a9.com/-/spec/opensearch/1.1/">
+  <opensearch:totalResults>${total}</opensearch:totalResults>
+  <opensearch:startIndex>${start}</opensearch:startIndex>
+  ${entries}
+</feed>`);
+    });
+  }
+
+  const textOf = (result: { content: { type: string; text?: string }[] }) =>
+    result.content.map((block) => (block.type === 'text' ? block.text : '')).join('\n');
+
+  it('cuts a page that would cross result 10,000 to the results arXiv serves', async () => {
+    fakeArxiv(13_549);
+    const result = await getArxivService().search(
+      'all:the',
+      { start: 9_990, maxResults: 50 },
+      createMockContext(),
+    );
+
+    expect(requests).toEqual([[9_990, 10]]);
+    expect(result.papers).toHaveLength(10);
+    expect(result.result_limit).toBe(10_000);
+  });
+
+  it('sends a page ending exactly at result 10,000 unchanged', async () => {
+    fakeArxiv(13_549);
+    await getArxivService().search(
+      'all:the',
+      { start: 9_950, maxResults: 50 },
+      createMockContext(),
+    );
+    expect(requests).toEqual([[9_950, 50]]);
+  });
+
+  it('refuses a start with nothing reachable before any request, naming the range', async () => {
+    fakeArxiv(13_549);
+    await expect(
+      getArxivService().search('all:the', { start: 10_000, maxResults: 1 }, createMockContext()),
+    ).rejects.toMatchObject({
+      code: JsonRpcErrorCode.ValidationError,
+      message: expect.stringContaining('first 10000 results'),
+      data: { reason: 'start_beyond_result_limit', start: 10_000, resultLimit: 10_000 },
+    });
+    expect(mockFetch).not.toHaveBeenCalled();
+  });
+
+  it('discloses a cut page through structuredContent and content[]', async () => {
+    fakeArxiv(13_549);
+    const result = await runToolContract(arxivSearchPapers, {
+      query: 'all:the',
+      start: 9_990,
+      max_results: 50,
+    });
+
+    expect(result.isError, JSON.stringify(result)).not.toBe(true);
+    expect(requests).toEqual([[9_990, 10]]);
+    const structured = result.structuredContent as {
+      papers: unknown[];
+      truncated: boolean;
+      shown: number;
+      cap: number;
+      notice: string;
+    };
+    expect(structured).toMatchObject({ truncated: true, shown: 10, cap: 10 });
+    expect(structured.papers).toHaveLength(10);
+    expect(structured.notice).toContain('arXiv serves only the first 10000');
+    expect(structured.notice).toContain('submitted_from');
+    expect(structured.notice).not.toMatch(/start=/);
+    const text = textOf(result);
+    expect(text).toContain('arXiv serves only the first 10000');
+    expect(text).toContain('\n**truncated:** true\n**shown:** 10\n**cap:** 10\n');
+  });
+
+  it('refuses start=10000 at the tool with start_beyond_result_limit and its recovery', async () => {
+    fakeArxiv(13_549);
+    const result = await runToolContract(arxivSearchPapers, {
+      query: 'all:the',
+      start: 10_000,
+      max_results: 10,
+    });
+
+    expect(result.isError).toBe(true);
+    expect(mockFetch).not.toHaveBeenCalled();
+    const error = (
+      result.structuredContent as {
+        error: { code: number; data: { reason: string; recovery: { hint: string } } };
+      }
+    ).error;
+    expect(error.code).toBe(JsonRpcErrorCode.ValidationError);
+    expect(error.data.reason).toBe('start_beyond_result_limit');
+    expect(error.data.recovery.hint).toContain('below 10000');
+    expect(error.data.recovery.hint).toContain('submitted_from');
+    expect(textOf(result)).toContain('below 10000');
+  });
+
+  // Every recipe the truncation notice prints has to run: follow the printed
+  // start= against the fake and confirm arXiv is never asked past 10,000.
+  it.each([
+    { total: 9_995, start: 9_900 },
+    { total: 10_000, start: 9_940 },
+    { total: 42, start: 0 },
+  ])(
+    'follows the printed start= without a 500 (total $total from $start)',
+    async ({ total, start }) => {
+      fakeArxiv(total);
+      let next: number | undefined = start;
+      let pages = 0;
+      while (next !== undefined) {
+        const page: number = next;
+        const result = await runToolContract(arxivSearchPapers, {
+          query: 'all:the',
+          start: page,
+          max_results: 50,
+        });
+        expect(result.isError, JSON.stringify(result)).not.toBe(true);
+        const notice: string | undefined = (result.structuredContent as { notice?: string }).notice;
+        const printed: string | undefined = notice ? /start=(\d+)/.exec(notice)?.[1] : undefined;
+        next = printed === undefined ? undefined : Number(printed);
+        pages++;
+        expect(pages).toBeLessThan(5);
+      }
+      expect(requests.every(([s, m]) => s + m <= 10_000)).toBe(true);
+      // The walk reached the last match.
+      const [lastStart, lastMax] = requests.at(-1) ?? [0, 0];
+      expect(lastStart + lastMax).toBeGreaterThanOrEqual(total);
+    },
+  );
+});
+
+// ---------------------------------------------------------------------------
 // getPapers()
 // ---------------------------------------------------------------------------
 
@@ -870,6 +1111,47 @@ describe('ArxivService.getPapers', () => {
     // URLs derive deterministically from the paper ID when <link> elements are omitted
     expect(paper?.pdf_url).toBe('https://arxiv.org/pdf/2401.99999v1');
     expect(paper?.abstract_url).toBe('https://arxiv.org/abs/2401.99999v1');
+  });
+
+  // Issue #45: element text that reads as a number keeps its exact upstream
+  // spelling, and a comment of "0" is a comment, not an absent one.
+  it('keeps numeric-looking text fields verbatim, and the feed counters as numbers', async () => {
+    mockFetch.mockResolvedValueOnce(
+      atomResponse(`<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom"
+      xmlns:opensearch="http://a9.com/-/spec/opensearch/1.1/"
+      xmlns:arxiv="http://arxiv.org/schemas/atom">
+  <opensearch:totalResults>3</opensearch:totalResults>
+  <opensearch:startIndex>2</opensearch:startIndex>
+  <entry>
+    <id>http://arxiv.org/abs/2401.00045v1</id>
+    <title>1.10</title>
+    <summary>007</summary>
+    <author><name>1e5</name></author>
+    <author><name>+5</name></author>
+    <category term="1.10" />
+    <published>2024-01-22T00:00:00Z</published>
+    <updated>2024-01-22T00:00:00Z</updated>
+    <arxiv:comment>0</arxiv:comment>
+    <arxiv:journal_ref>0x1F</arxiv:journal_ref>
+    <arxiv:doi>-0.50</arxiv:doi>
+  </entry>
+</feed>`),
+    );
+    const result = await getArxivService().search('all:numeric', {}, createMockContext());
+    const [paper] = result.papers;
+
+    expect(result.total_results).toBe(3);
+    expect(result.start).toBe(2);
+    expect(paper).toMatchObject({
+      title: '1.10',
+      abstract: '007',
+      authors: ['1e5', '+5'],
+      categories: ['1.10'],
+      comment: '0',
+      journal_ref: '0x1F',
+      doi: '-0.50',
+    });
   });
 });
 
@@ -1282,6 +1564,93 @@ describe('ArxivService.readContent', () => {
   }, 30_000);
 
   // -------------------------------------------------------------------------
+  // ar5iv conversion-failure pages fall through to the PDF (issue #54)
+  // -------------------------------------------------------------------------
+
+  /** Queue metadata, an arxiv.org/html 404, and `ar5ivPage` as ar5iv's 200 answer. */
+  function serveAr5ivPage(ar5ivPage: string): void {
+    mockFetch
+      .mockResolvedValueOnce(atomResponse(atomFor('hep-th/9711200v3')))
+      .mockResolvedValueOnce(new Response('Not Found', { status: 404 }))
+      .mockResolvedValueOnce(
+        servedPage(ar5ivPage, 'https://ar5iv.labs.arxiv.org/html/hep-th/9711200v3'),
+      );
+  }
+
+  const FATAL_NOTICE =
+    '<span class="ltx_ERROR">\nConversion to HTML had a Fatal error and exited abruptly. This document may be truncated or damaged.\n</span>';
+
+  it('serves an ar5iv page whose prose mentions a fatal error', async () => {
+    serveAr5ivPage(
+      '<article class="ltx_document"><p class="ltx_p">LaTeXML prints "Conversion to HTML had a Fatal error and exited abruptly" when the solver hits a Fatal error.</p></article>',
+    );
+
+    const result = await getArxivService().readContent('hep-th/9711200v3', {}, createMockContext());
+
+    expect(result.source).toBe('ar5iv');
+    expect(result.content).toContain('when the solver hits a Fatal error');
+    expect(mockFetch).toHaveBeenCalledTimes(3);
+  });
+
+  it('serves a partial ar5iv render that carries the fatal-error notice beside paper text', async () => {
+    serveAr5ivPage(
+      `<article class="ltx_document"><div class="ltx_para">${FATAL_NOTICE}</div><section class="ltx_section"><p class="ltx_p">Partial body text.</p></section></article>`,
+    );
+
+    const result = await getArxivService().readContent('hep-th/9711200v3', {}, createMockContext());
+
+    expect(result.source).toBe('ar5iv');
+    expect(result.content).toContain('Partial body text.');
+  });
+
+  it('falls through the captured ar5iv conversion-failure page to the PDF', async () => {
+    serveAr5ivPage(fixturePage('ar5iv-hep-th_9711200v3'));
+    mockFetch.mockResolvedValueOnce(pdfResponse('Supergravity and the large N limit'));
+
+    const result = await getArxivService().readContent('hep-th/9711200v3', {}, createMockContext());
+
+    expect(result.source).toBe('pdf_text');
+    expect(result.content).toContain('Supergravity and the large N limit');
+    expect(result.content).not.toContain('Fatal error');
+    expect(String(mockFetch.mock.calls[3]?.[0])).toBe('https://arxiv.org/pdf/hep-th/9711200v3');
+  });
+
+  it('falls through a failure page whose notice sits inside an otherwise empty article', async () => {
+    serveAr5ivPage(
+      `<article class="ltx_document">\n<div class="ltx_para">${FATAL_NOTICE}</div>\n</article>`,
+    );
+    mockFetch.mockResolvedValueOnce(pdfResponse('pdf body'));
+
+    const result = await getArxivService().readContent('hep-th/9711200v3', {}, createMockContext());
+
+    expect(result.source).toBe('pdf_text');
+  });
+
+  it('reports content_unavailable when ar5iv serves only a failure page and there is no PDF', async () => {
+    serveAr5ivPage(fixturePage('ar5iv-hep-th_9711200v3'));
+    mockFetch.mockResolvedValueOnce(new Response('Not Found', { status: 404 }));
+
+    await expect(
+      getArxivService().readContent('hep-th/9711200v3', {}, createMockContext()),
+    ).rejects.toMatchObject({
+      code: JsonRpcErrorCode.NotFound,
+      data: { reason: 'content_unavailable' },
+    });
+  });
+
+  it('reports pdf_extraction_failed when ar5iv serves only a failure page and the PDF has no text', async () => {
+    serveAr5ivPage(fixturePage('ar5iv-hep-th_9711200v3'));
+    mockFetch.mockResolvedValueOnce(pdfResponse(''));
+
+    await expect(
+      getArxivService().readContent('hep-th/9711200v3', {}, createMockContext()),
+    ).rejects.toMatchObject({
+      code: JsonRpcErrorCode.NotFound,
+      data: { reason: 'pdf_extraction_failed' },
+    });
+  });
+
+  // -------------------------------------------------------------------------
   // Unbounded reads (issue #24)
   // -------------------------------------------------------------------------
 
@@ -1449,8 +1818,8 @@ describe('ArxivService.readContent', () => {
   });
 
   it('preserves structural ltx_* class attributes (section, title, bibliography) while stripping noise', async () => {
-    // Section boundaries must survive cleaning so downstream tooling (or a
-    // future section-scoped read parameter) can identify them. Decorative
+    // Section boundaries must survive cleaning so the outline and downstream
+    // tooling can identify them. Decorative
     // classes like ltx_text and ltx_font_bold should still be stripped.
     const raw = [
       '<article>',
@@ -1502,6 +1871,262 @@ describe('ArxivService.readContent', () => {
     }
   });
 
+  // -------------------------------------------------------------------------
+  // Article boundary and served-URL resolution (issue #43)
+  // -------------------------------------------------------------------------
+
+  it('keeps the whole tail of a page with no <article> (ltx_page_main fallback)', async () => {
+    const raw =
+      '<html><head><title>t</title></head><body><nav>chrome</nav>' +
+      '<div class="ltx_page_main"><p>Body</p></div><footer>site footer</footer></body></html>';
+    mockFetch
+      .mockResolvedValueOnce(atomResponse(ATOM_SINGLE))
+      .mockResolvedValueOnce(htmlResponse(raw));
+
+    const result = await getArxivService().readContent('2401.12345', {}, createMockContext());
+
+    expect(result.content).toBe('<div><p>Body</p></div><footer>site footer</footer></body></html>');
+    expect(result.total_characters).toBe(raw.length - raw.indexOf('<div class="ltx_page_main"'));
+  });
+
+  it('ends the body at </article>, dropping the arxiv.org site footer', async () => {
+    const result = await readFixture('math/9201201v1', 'native-math_9201201v1', 'arxiv_html');
+
+    expect(result.body_characters).toBe(9449);
+    expect(result.content.endsWith('</article>')).toBe(true);
+    expect(result.content).not.toContain('arxiv-html-footer');
+    expect(result.content).not.toContain('ds-funder-logo');
+    expect(result.total_characters).toBeLessThan(fixturePage('native-math_9201201v1').length);
+  });
+
+  it('ends the body at </article> on the ar5iv rung too', async () => {
+    const result = await readFixture('math/9201201v1', 'ar5iv-math_9201201v1', 'ar5iv');
+
+    expect(result.source).toBe('ar5iv');
+    expect(result.body_characters).toBe(9449);
+    expect(result.content.endsWith('</article>')).toBe(true);
+    expect(result.content).not.toContain('ar5iv-footer');
+    expect(result.content).not.toContain('<script');
+  });
+
+  it('pages the last chunk of article content, not footer chrome', async () => {
+    const result = await readFixture('math/9201201v1', 'native-math_9201201v1', 'arxiv_html', {
+      maxCharacters: 100_000,
+      start: 9000,
+    });
+
+    expect(result.content.endsWith('</article>')).toBe(true);
+    expect(result.content).not.toMatch(/<svg|<path/);
+    expect(result.truncated).toBe(false);
+  });
+
+  it('resolves relative figure src and object data against the served page URL', async () => {
+    const result = await readFixture('1706.03762v7', 'native-1706.03762v7', 'arxiv_html');
+
+    const srcs = attrValues(result.content, 'src');
+    const datas = attrValues(result.content, 'data');
+    expect(srcs).toHaveLength(3);
+    expect(datas).toHaveLength(5);
+    expect(srcs).toContain('https://arxiv.org/html/1706.03762v7/Figures/ModalNet-21.png');
+    expect(datas).toContain('https://arxiv.org/html/1706.03762v7/making_more_difficult5_new.svg');
+    for (const value of [...srcs, ...datas]) {
+      expect(value.startsWith('https://arxiv.org/html/1706.03762v7/')).toBe(true);
+    }
+  });
+
+  it('leaves fragment, mailto, and absolute links as they are', async () => {
+    const result = await readFixture('1706.03762v7', 'native-1706.03762v7', 'arxiv_html');
+
+    const hrefs = attrValues(result.content, 'href');
+    expect(hrefs).toContain('#bib.bib13');
+    expect(hrefs.filter((h) => h.startsWith('#'))).toHaveLength(75);
+    expect(hrefs.filter((h) => h.startsWith('mailto:'))).toHaveLength(8);
+    expect(hrefs.filter((h) => h.startsWith('https://github.com/'))).toHaveLength(1);
+    expect(hrefs.every((h) => /^(#|mailto:|https:\/\/)/.test(h))).toBe(true);
+  });
+
+  it('resolves ar5iv root-relative asset paths against the ar5iv host', async () => {
+    const result = await readFixture('1706.03762v7', 'ar5iv-1706.03762v7', 'ar5iv');
+
+    const srcs = attrValues(result.content, 'src');
+    expect(srcs).toContain(
+      'https://ar5iv.labs.arxiv.org/html/1706.03762/assets/Figures/ModalNet-21.png',
+    );
+    for (const value of [...srcs, ...attrValues(result.content, 'data')]) {
+      expect(value.startsWith('https://ar5iv.labs.arxiv.org/html/1706.03762/assets/')).toBe(true);
+    }
+  });
+
+  it('resolves a legacy-ID figure under its archive and keeps appendix and bibliography', async () => {
+    const result = await readFixture(
+      'astro-ph/0603449v2',
+      'native-astro-ph_0603449v2-headings',
+      'arxiv_html',
+    );
+
+    expect(attrValues(result.content, 'src')).toEqual([
+      'https://arxiv.org/html/astro-ph/0603449v2/f1.png',
+    ]);
+    expect(result.content).toContain('ltx_title_appendix');
+    expect(result.content).toContain('ltx_title_bibliography');
+    expect(result.content.endsWith('</article>')).toBe(true);
+  });
+
+  it('resolves against the URL that served the page, not the URL requested', async () => {
+    // A redirect to a trailing-slash URL moves the base one segment deeper.
+    mockFetch
+      .mockResolvedValueOnce(atomResponse(ATOM_SINGLE))
+      .mockResolvedValueOnce(
+        servedPage(
+          '<article><img src="x1.png"><a href="../up.html">u</a></article>',
+          'https://arxiv.org/html/2401.12345v1/',
+        ),
+      );
+
+    const result = await getArxivService().readContent('2401.12345', {}, createMockContext());
+
+    expect(result.content).toBe(
+      '<article><img src="https://arxiv.org/html/2401.12345v1/x1.png">' +
+        '<a href="https://arxiv.org/html/up.html">u</a></article>',
+    );
+  });
+
+  it('resolves against the requested URL when the response carries none', async () => {
+    mockFetch
+      .mockResolvedValueOnce(atomResponse(ATOM_SINGLE))
+      .mockResolvedValueOnce(htmlResponse('<article><img src="2401.12345v1/x1.png"></article>'));
+
+    const result = await getArxivService().readContent('2401.12345', {}, createMockContext());
+
+    expect(result.content).toBe(
+      '<article><img src="https://arxiv.org/html/2401.12345v1/x1.png"></article>',
+    );
+  });
+
+  // -------------------------------------------------------------------------
+  // Section outline (issue #44)
+  // -------------------------------------------------------------------------
+
+  it('outlines sectioning headings by tag depth, with offsets into the cleaned body', async () => {
+    const result = await readFixture('1706.03762v7', 'native-1706.03762v7', 'arxiv_html');
+    const outline = result.outline ?? [];
+
+    expect(outline).toHaveLength(29);
+    expect(outline[0]).toMatchObject({ level: 1, title: '1 Introduction' });
+    expect(outline).toContainEqual(
+      expect.objectContaining({ level: 2, title: '3.1 Encoder and Decoder Stacks' }),
+    );
+    expect(outline).toContainEqual(expect.objectContaining({ level: 4, title: 'Encoder:' }));
+    expect(outline).toContainEqual(expect.objectContaining({ level: 1, title: 'References' }));
+    const counts: Record<number, number> = {};
+    for (const entry of outline) counts[entry.level] = (counts[entry.level] ?? 0) + 1;
+    expect(counts).toEqual({ 1: 9, 2: 12, 3: 3, 4: 5 });
+    for (const entry of outline) {
+      expect(result.content.startsWith(`<h${entry.level + 1}`, entry.start), entry.title).toBe(
+        true,
+      );
+    }
+    expect(result.outline_omitted_levels).toBeUndefined();
+  });
+
+  it('outlines the ar5iv render of a paper with the same titles and levels', async () => {
+    const native = await readFixture('1706.03762v7', 'native-1706.03762v7', 'arxiv_html');
+    const ar5iv = await readFixture('1706.03762v7', 'ar5iv-1706.03762v7', 'ar5iv');
+
+    const shape = (o: typeof native.outline) => o?.map(({ level, title }) => ({ level, title }));
+    expect(shape(ar5iv.outline)).toEqual(shape(native.outline));
+  });
+
+  it('reads from a heading when an outline entry start is passed back', async () => {
+    const first = await readFixture('1706.03762v7', 'native-1706.03762v7', 'arxiv_html', {
+      maxCharacters: 100_000,
+    });
+    const entry = first.outline?.find((e) => e.title === '3.2 Attention');
+    expect(entry).toBeDefined();
+
+    const jump = await readFixture('1706.03762v7', 'native-1706.03762v7', 'arxiv_html', {
+      maxCharacters: 2_000,
+      start: entry?.start ?? -1,
+    });
+    expect(jump.content).toMatch(/^<h3 class="ltx_title ltx_title_subsection">.{0,40}3\.2 /);
+    expect(jump.outline).toBeUndefined();
+    expect(jump.outline_omitted_levels).toBeUndefined();
+  });
+
+  it('levels headings by tag, so subsections rendered as <h2> are level 1', async () => {
+    const result = await readFixture('math/9201201v1', 'native-math_9201201v1', 'arxiv_html');
+
+    expect(result.outline).toEqual([
+      { level: 1, title: '1', start: expect.any(Number) },
+      { level: 1, title: '2', start: expect.any(Number) },
+      { level: 1, title: 'References', start: expect.any(Number) },
+    ]);
+  });
+
+  it('leaves theorem, proof, abstract, and contents titles out of the outline', async () => {
+    const result = await readFixture('2405.03599v3', 'native-2405.03599v3-headings', 'arxiv_html');
+    const outline = result.outline ?? [];
+    const classOf = (entry: (typeof outline)[number]) =>
+      /^<h[1-6] class="([^"]*)">/.exec(result.content.slice(entry.start))?.[1] ?? '';
+
+    expect(result.content).toContain('ltx_title_theorem');
+    expect(result.content).toContain('ltx_title_proof');
+    expect(outline).toHaveLength(183);
+    for (const entry of outline) {
+      expect(classOf(entry)).toMatch(/ltx_title_(section|subsection|subsubsection|bibliography)\b/);
+    }
+  });
+
+  it('cuts a single-level outline over 200 entries and says where it continues', async () => {
+    const sections = Array.from(
+      { length: 201 },
+      (_, i) =>
+        `<section class="ltx_section"><h2 class="ltx_title ltx_title_section">${i + 1} Part</h2><p>x</p></section>`,
+    ).join('');
+    mockFetch
+      .mockResolvedValueOnce(atomResponse(ATOM_SINGLE))
+      .mockResolvedValueOnce(
+        htmlResponse(`<html><body><article>${sections}</article></body></html>`),
+      );
+
+    const result = await getArxivService().readContent(
+      '2401.12345',
+      { maxCharacters: null },
+      createMockContext(),
+    );
+
+    expect(result.outline).toHaveLength(200);
+    expect(result.outline?.at(-1)?.title).toBe('200 Part');
+    expect(result).not.toHaveProperty('outline_omitted_levels');
+    const next = result.outline_continues_at ?? -1;
+    expect(result.content.slice(next)).toMatch(/^<h2 class="ltx_title ltx_title_section">201 Part/);
+  });
+
+  it('omits the outline on any page past the first', async () => {
+    const result = await readFixture('math/9201201v1', 'native-math_9201201v1', 'arxiv_html', {
+      maxCharacters: 100,
+      start: 1,
+    });
+
+    expect(result).not.toHaveProperty('outline');
+    expect(result).not.toHaveProperty('outline_omitted_levels');
+    expect(result).not.toHaveProperty('outline_continues_at');
+  });
+
+  it('returns an empty outline for PDF text on the first page', async () => {
+    mockFetch
+      .mockResolvedValueOnce(atomResponse(ATOM_SINGLE))
+      .mockResolvedValueOnce(new Response('Not Found', { status: 404 }))
+      .mockResolvedValueOnce(new Response('', { status: 307 }))
+      .mockResolvedValueOnce(pdfResponse('1 Introduction'));
+
+    const result = await getArxivService().readContent('2401.12345', {}, createMockContext());
+
+    expect(result.source).toBe('pdf_text');
+    expect(result.outline).toEqual([]);
+    expect(result).not.toHaveProperty('outline_omitted_levels');
+  });
+
   it('throws on unexpected content-type from API', async () => {
     mockFetch.mockResolvedValueOnce(
       new Response('Internal error', {
@@ -1513,5 +2138,372 @@ describe('ArxivService.readContent', () => {
     const service = getArxivService();
 
     await expect(service.readContent('2401.12345', {}, ctx)).rejects.toThrow(/content-type/i);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Cleaning passes stay linear in page length (issue #52)
+// ---------------------------------------------------------------------------
+
+/**
+ * Per-call thread CPU of `fn`, in ms: the fastest of three samples, each
+ * repeating `fn` until it has used ~20 ms of CPU.
+ */
+function cpuMs(fn: () => unknown): number {
+  let best = Number.POSITIVE_INFINITY;
+  for (let sample = 0; sample < 3; sample++) {
+    const start = process.threadCpuUsage();
+    let calls = 0;
+    let usedMs = 0;
+    do {
+      fn();
+      calls++;
+      const used = process.threadCpuUsage(start);
+      usedMs = (used.user + used.system) / 1000;
+    } while (usedMs < 20);
+    best = Math.min(best, usedMs / calls);
+  }
+  return best;
+}
+
+/**
+ * Assert `run` stays linear on `unit` repeated to a length that doubles from 5k
+ * to 320k characters. Each size must meet an absolute CPU bound before the next
+ * runs, so a superlinear cost fails at the first doubling it outgrows; the full
+ * 64× span must cost under 256× (a quadratic costs ~4,096×).
+ */
+function expectLinear(unit: string, run: (input: string) => unknown): void {
+  const times: number[] = [];
+  for (let size = 5_000; size <= 320_000; size *= 2) {
+    const input = unit.repeat(Math.ceil(size / unit.length)).slice(0, size);
+    const ms = cpuMs(() => run(input));
+    expect(ms, `${size} characters took ${ms.toFixed(2)} ms`).toBeLessThan(2 + size / 2_000);
+    times.push(ms);
+  }
+  expect((times.at(-1) ?? 0) / (times[0] ?? 1)).toBeLessThan(256);
+}
+
+// Cost bounds are thread CPU; the wall-clock timeout only has to outlast a loaded machine.
+describe('HTML cleaning passes', { timeout: 30_000 }, () => {
+  it('collapses MathML on the captured pages exactly as the regex pass did', () => {
+    // SHA-256 of each page's collapseMathML output from the original
+    // `/<math\b([^>]*)>([\s\S]*?)<\/math>/g` implementation.
+    const expected: Record<string, string> = {
+      'ar5iv-1706.03762v7': 'd530895e13a1b41f7a731c15931389f45d9044c74bdc5705306567e293e631f7',
+      'ar5iv-math_9201201v1': '1c16c81e0d7f9fa45542187c58bf52e5637b2f4462562c3f360dc128bed7c29f',
+      'native-1706.03762v7': 'd791ea56609b14505ebbd8eb7f30e70e9e0e6e4535d59301251b264f6ac906aa',
+      'native-2405.03599v3-headings':
+        '3ee942b605da0e1e6ea7a9643e381dd7c9d7dda4e7f3e6d154d0e949f6cc52c7',
+      'native-astro-ph_0603449v2-headings':
+        'e60d831b28684156377261906b05f019dad906bdd12fbe066feb29629083cbed',
+      'native-math_9201201v1': '9b4c24faccf9c50b1688507d0ed215b95c74cfa0877692b1e33845362f430c29',
+    };
+    for (const [name, hash] of Object.entries(expected)) {
+      const collapsed = collapseMathML(fixturePage(name));
+      expect(createHash('sha256').update(collapsed).digest('hex'), name).toBe(hash);
+    }
+  });
+
+  it('leaves an unclosed <math> element in place and still collapses the closed ones before it', () => {
+    const closed =
+      '<math display="inline"><annotation encoding="application/x-tex">x</annotation></math>';
+    expect(collapseMathML(`a ${closed} b <math>y c`)).toBe('a $x$ b <math>y c');
+    expect(collapseMathML(`<mathvariant>${closed}`)).toBe('<mathvariant>$x$');
+    expect(collapseMathML('<math alttext="z"')).toBe('<math alttext="z"');
+  });
+
+  it('takes the first x-tex annotation and skips other annotation encodings', () => {
+    const tex = (body: string) => collapseMathML(`<math>${body}</math>`);
+    expect(
+      tex(
+        '<annotation-xml encoding="MathML-Content"><ci>a</ci></annotation-xml>' +
+          '<annotation encoding="application/x-tex">a</annotation>',
+      ),
+    ).toBe('$a$');
+    expect(tex('<annotation encoding="application/x-tex">unclosed')).toBe('');
+    expect(tex('<annotation encoding="text/plain">p</annotation>')).toBe('');
+  });
+
+  it('keeps the <math> element match linear in page length', () => {
+    expectLinear('<math>x ', collapseMathML);
+  });
+
+  it('keeps the <math> tag read linear in page length', () => {
+    expectLinear('<math x ', collapseMathML);
+  });
+
+  it('keeps the TeX annotation read linear in page length', () => {
+    expectLinear('<annotation encoding="application/x-tex">x ', (s) =>
+      collapseMathML(`<math>${s}</math>`),
+    );
+    expectLinear('<annotation x ', (s) => collapseMathML(`<math>${s}</math>`));
+  });
+
+  it('keeps the <article> boundary search linear in page length', () => {
+    expectLinear('<article ', stripHtmlHead);
+  });
+
+  it('keeps the outline heading scan linear in page length', () => {
+    const opener = '<h2 class="ltx_title ltx_title_section">';
+    expectLinear(opener, buildOutline);
+    expectLinear(`${opener}x `, (s) => buildOutline(`${s}</h2>`));
+    expectLinear('<h2 class="ltx_title ltx_title_section ', buildOutline);
+  });
+
+  it('keeps relative-URL resolution linear in page length', () => {
+    const base = 'https://arxiv.org/html/2401.12345v1';
+    expectLinear('<a', (s) => resolveRelativeUrls(s, base));
+    expectLinear('<img alt="x" ', (s) => resolveRelativeUrls(s, base));
+    expectLinear(' src="x', (s) => resolveRelativeUrls(`<img${s}>`, base));
+  });
+
+  it('strips LaTeXML noise on the captured pages exactly as before', () => {
+    // SHA-256 of each whole page's stripLatexmlNoise output, recorded before the
+    // issue #52 change to the class/id passes.
+    const expected: Record<string, string> = {
+      'ar5iv-1706.03762v7': 'bc306220be20926dba00028a4f4aa542adda8dbc2a310e740bd8aeeca6c76566',
+      'ar5iv-hep-th_9711200v3': '7ba9559b5c5357b95b23bdfeaaba77b407e6b0b28d59aaf3245e14c3bf15d16d',
+      'ar5iv-math_9201201v1': 'ff0f05da6bb7c00f067fac54fab7796e256bf0b16e661079522c26f4f3e6047e',
+      'native-1706.03762v7': 'd27d29a5d3823418af9ff492eb1a93df44d933cdb3b834503e446ed90605f9fe',
+      'native-2405.03599v3-headings':
+        '4bd26d44c28c99c143343723443d14e1500a64396eff4c37b24e723a23e820e0',
+      'native-astro-ph_0603449v2-headings':
+        '5e5ddd3d87cd993a361cd792dfcddeaffbd0793fae287c81c37a22ba504d4172',
+      'native-math_9201201v1': 'c12f00dfcc75d3d1de2763395f22e45ff5c08160768ff1218ac7d6f76f5cb57e',
+    };
+    for (const [name, hash] of Object.entries(expected)) {
+      const stripped = stripLatexmlNoise(fixturePage(name));
+      expect(createHash('sha256').update(stripped).digest('hex'), name).toBe(hash);
+    }
+  });
+
+  it('strips a noise attribute together with the whole whitespace run before it', () => {
+    expect(stripLatexmlNoise('<p \n  class="ltx_p"  id="p1">x</p>')).toBe('<p>x</p>');
+    expect(stripLatexmlNoise('<h2   class="ltx_title ltx_title_section"\tid="S1">')).toBe(
+      '<h2   class="ltx_title ltx_title_section">',
+    );
+    expect(stripLatexmlNoise('<span class="other">  class="ltx_x"')).toBe('<span class="other">');
+  });
+
+  it('keeps the class and id strip linear in page length', () => {
+    expectLinear(' ', stripLatexmlNoise);
+    expectLinear('\n', stripLatexmlNoise);
+    expectLinear(' x', stripLatexmlNoise);
+  });
+
+  it('keeps the noise-attribute value read linear in page length', () => {
+    expectLinear(' class="ltx_x ', stripLatexmlNoise);
+    expectLinear(' id="x ', stripLatexmlNoise);
+  });
+
+  it('keeps the <br> collapse linear in page length', () => {
+    expectLinear('<br ', stripLatexmlNoise);
+    expectLinear('<br>x', stripLatexmlNoise);
+    expectLinear('<br>\n<br', stripLatexmlNoise);
+  });
+
+  it('keeps the ltx_page_main fallback search linear in page length', () => {
+    expectLinear(' ', (s) => stripHtmlHead(`<div${s}`));
+    expectLinear('<div ', stripHtmlHead);
+  });
+
+  it('keeps the alttext read linear in page length', () => {
+    expectLinear('alttext=x ', (s) => collapseMathML(`<math ${s}></math>`));
+    expectLinear('alttext="x ', (s) => collapseMathML(`<math ${s}></math>`));
+  });
+});
+
+describe('isConversionFailurePage', { timeout: 30_000 }, () => {
+  const NOTICE =
+    'Conversion to HTML had a Fatal error and exited abruptly. This document may be truncated or damaged.';
+
+  it('recognizes the captured ar5iv conversion-failure page', () => {
+    expect(isConversionFailurePage(fixturePage('ar5iv-hep-th_9711200v3'))).toBe(true);
+  });
+
+  it('passes every captured render, including one with undefined-macro error spans', () => {
+    for (const name of [
+      'ar5iv-1706.03762v7',
+      'ar5iv-math_9201201v1',
+      'native-1706.03762v7',
+      'native-2405.03599v3-headings',
+      'native-astro-ph_0603449v2-headings',
+      'native-math_9201201v1',
+    ]) {
+      expect(isConversionFailurePage(fixturePage(name)), name).toBe(false);
+    }
+  });
+
+  it('recognizes the notice inside an article with no other text', () => {
+    expect(
+      isConversionFailurePage(
+        `<article>\n<div class="ltx_para"><span class="ltx_ERROR">\n${NOTICE}\n</span></div>\n</article>`,
+      ),
+    ).toBe(true);
+  });
+
+  it('passes a page with paper text beside the notice, or the notice outside its error span', () => {
+    expect(
+      isConversionFailurePage(
+        `<article><span class="ltx_ERROR">${NOTICE}</span><p>Partial body.</p></article>`,
+      ),
+    ).toBe(false);
+    expect(isConversionFailurePage(`<article><p>${NOTICE}</p></article>`)).toBe(false);
+    expect(isConversionFailurePage('<article></article>')).toBe(false);
+  });
+
+  it('keeps the failure-page check linear in page length', () => {
+    const page = (s: string) => isConversionFailurePage(`<article>${NOTICE}${s}</article>`);
+    expectLinear('<span class="ltx_ERROR ', page);
+    expectLinear('<span class="ltx_ERROR">x ', page);
+    expectLinear(`<span class="ltx_ERROR">${NOTICE} `, page);
+    expectLinear('<a', page);
+    expectLinear(`${NOTICE} `, page);
+  });
+
+  it('keeps the error-span read linear in page length', () => {
+    expectLinear(`${NOTICE} `, (s) =>
+      isConversionFailurePage(`<article><span class="ltx_ERROR">${s}</article>`),
+    );
+  });
+});
+
+describe('buildOutline', () => {
+  const KIND_BY_TAG: Record<number, string> = {
+    2: 'section',
+    3: 'subsection',
+    4: 'subsubsection',
+    5: 'paragraph',
+  };
+  /** A cleaned LaTeXML heading as `stripLatexmlNoise` leaves it. */
+  const heading = (tag: number, title: string) =>
+    `<h${tag} class="ltx_title ltx_title_${KIND_BY_TAG[tag]}">${title}</h${tag}>`;
+
+  it('returns no entries for a body without sectioning headings', () => {
+    expect(buildOutline('')).toEqual({ entries: [], omittedLevels: [] });
+    expect(
+      buildOutline('<p>text</p><h6 class="ltx_title ltx_title_theorem">Theorem 1</h6>'),
+    ).toEqual({ entries: [], omittedLevels: [] });
+  });
+
+  it('keeps every entry at exactly the 200-entry cap', () => {
+    const body = Array.from({ length: 200 }, (_, i) => heading(i % 2 ? 3 : 2, `H${i}`)).join('');
+
+    const { entries, omittedLevels } = buildOutline(body);
+    expect(entries).toHaveLength(200);
+    expect(omittedLevels).toEqual([]);
+  });
+
+  it('drops the deepest level whole when the outline passes 200 entries', () => {
+    const sections = Array.from({ length: 10 }, (_, s) =>
+      [
+        heading(2, `${s + 1} Section`),
+        ...Array.from({ length: 25 }, (_, ss) => heading(3, `${s + 1}.${ss + 1} Sub`)),
+      ].join('<p>body</p>'),
+    );
+    const body = sections.join('');
+
+    const { entries, omittedLevels } = buildOutline(body);
+    expect(entries).toHaveLength(10);
+    expect(entries.every((e) => e.level === 1)).toBe(true);
+    expect(entries.map((e) => e.title)).toEqual(
+      Array.from({ length: 10 }, (_, s) => `${s + 1} Section`),
+    );
+    expect(omittedLevels).toEqual([2]);
+    for (const entry of entries) expect(body.startsWith('<h2', entry.start)).toBe(true);
+  });
+
+  it('keeps dropping levels, deepest first, until the rest fit', () => {
+    // 5 sections, each with 20 subsections of 1 subsubsection and 1 paragraph:
+    // 5 + 100 + 100 + 100 = 305 → drop level 4 (205) → drop level 3 (105).
+    const body = Array.from({ length: 5 }, (_, s) =>
+      [
+        heading(2, `S${s}`),
+        ...Array.from({ length: 20 }, (_, ss) =>
+          [heading(3, `S${s}.${ss}`), heading(4, `S${s}.${ss}.a`), heading(5, `P${s}.${ss}`)].join(
+            '',
+          ),
+        ),
+      ].join(''),
+    ).join('');
+
+    const { entries, omittedLevels } = buildOutline(body);
+    expect(omittedLevels).toEqual([4, 3]);
+    expect(entries).toHaveLength(105);
+    expect(entries.slice(0, 3).map((e) => e.title)).toEqual(['S0', 'S0.0', 'S0.1']);
+    expect(new Set(entries.map((e) => e.level))).toEqual(new Set([1, 2]));
+  });
+
+  // A level alone over the cap has nothing deeper to drop: dropping it too
+  // emptied the outline. The shallowest level is cut at 200 instead, and
+  // continuesAt names the heading the caller reads on from.
+  it('keeps the first 200 entries when one level alone passes the cap', () => {
+    const body = Array.from({ length: 201 }, (_, i) => heading(2, `${i + 1} S`)).join('<p>x</p>');
+
+    const { entries, omittedLevels, continuesAt } = buildOutline(body);
+    expect(entries).toHaveLength(200);
+    expect(entries.at(-1)?.title).toBe('200 S');
+    expect(omittedLevels).toEqual([]);
+    const cut = body.lastIndexOf('<h2');
+    expect(continuesAt).toBe(cut);
+    expect(body.slice(cut)).toContain('201 S');
+  });
+
+  it('drops deeper levels whole, then cuts the shallowest at 200', () => {
+    const body = Array.from({ length: 250 }, (_, i) =>
+      [heading(2, `${i + 1} S`), heading(3, `${i + 1}.1 Sub`)].join(''),
+    ).join('');
+
+    const { entries, omittedLevels, continuesAt } = buildOutline(body);
+    expect(omittedLevels).toEqual([2]);
+    expect(entries).toHaveLength(200);
+    expect(entries.every((e) => e.level === 1)).toBe(true);
+    expect(continuesAt).toBe(body.indexOf(heading(2, '201 S')));
+  });
+
+  it('names no continuation when the outline fits', () => {
+    const body = Array.from({ length: 200 }, (_, i) => heading(2, `${i + 1} S`)).join('');
+    expect(buildOutline(body)).not.toHaveProperty('continuesAt');
+  });
+
+  it('builds titles from markup: tags stripped, references decoded, whitespace collapsed', () => {
+    const body =
+      '<h2 class="ltx_title ltx_title_section"><span>4 </span>Results &amp; \n  Discussion</h2>' +
+      '<h3 class="ltx_title ltx_title_subsection">Bounds on &#955; and &#x3bb; for $a&lt;b$&nbsp;&hellip;</h3>';
+
+    expect(buildOutline(body).entries.map((e) => e.title)).toEqual([
+      '4 Results & Discussion',
+      'Bounds on λ and λ for $a<b$ &hellip;',
+    ]);
+  });
+
+  it('cuts long titles at 120 characters', () => {
+    const { entries } = buildOutline(heading(2, 'word '.repeat(60)));
+
+    expect(entries[0]?.title).toHaveLength(120);
+    expect(entries[0]?.title.endsWith('…')).toBe(true);
+  });
+
+  it('skips headings that never close or close with another tag', () => {
+    const body =
+      `<h2 class="ltx_title ltx_title_section">Unclosed<p>${'x'.repeat(5000)}</p>` +
+      heading(2, 'Closed') +
+      '<h3 class="ltx_title ltx_title_subsection">Mismatched</h4>' +
+      '<h3 class="ltx_title ltx_title_subsection">Runs into the next<p>x</p>' +
+      heading(3, 'Last');
+
+    expect(buildOutline(body).entries.map((e) => e.title)).toEqual(['Closed', 'Last']);
+  });
+
+  it('keeps headings whose collapsed TeX holds < and >', () => {
+    // collapseMathML decodes &lt; and &gt;, so a heading's TeX carries them raw.
+    const body =
+      heading(2, '<span>2 </span>The regime $0<h<1$') +
+      heading(2, '<span>3 </span>Bounds with $a<b$ and $c>d$');
+
+    expect(buildOutline(body).entries.map((e) => e.title)).toEqual([
+      '2 The regime $0<h<1$',
+      '3 Bounds with $a<b$ and $c>d$',
+    ]);
   });
 });

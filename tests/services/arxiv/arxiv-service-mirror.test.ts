@@ -14,7 +14,7 @@ import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { arxivReadPaper } from '@/mcp-server/tools/definitions/arxiv-read-paper.tool.js';
-import { arxivSearch } from '@/mcp-server/tools/definitions/arxiv-search.tool.js';
+import { arxivSearchPapers } from '@/mcp-server/tools/definitions/arxiv-search-papers.tool.js';
 import { ArxivService, initArxivService } from '@/services/arxiv/arxiv-service.js';
 import { MirrorStore, resetStore } from '@/services/arxiv/mirror/store.js';
 import type { ArxivRawRecord } from '@/services/arxiv/mirror/types.js';
@@ -475,6 +475,36 @@ describe('ArxivService — mirror integration', () => {
       expect(mockFetch).toHaveBeenCalledTimes(1);
     });
 
+    // Issue #56: arXiv answers 500 past its first 10,000 results, so a recency
+    // bypass with nothing reachable there goes straight to the mirror.
+    it('answers a recency-bypass start past arXiv’s 10,000 results from the mirror, with no request', async () => {
+      configOverrides.mirrorRecentDaysLive = 2;
+      const result = await service.search(
+        'transformers',
+        { start: 10_000, sortBy: 'submitted', sortOrder: 'descending' },
+        createMockContext(),
+      );
+
+      expect(mockFetch).not.toHaveBeenCalled();
+      expect(result.start).toBe(10_000);
+      expect(result.total_results).toBe(1);
+      expect(result.result_limit).toBeUndefined();
+    });
+
+    it('cuts a recency-bypass page at arXiv’s 10,000th result', async () => {
+      configOverrides.mirrorRecentDaysLive = 2;
+      mockFetch.mockResolvedValueOnce(atomResponse(ATOM_EMPTY));
+      const result = await service.search(
+        'transformers',
+        { start: 9_995, maxResults: 50, sortBy: 'submitted', sortOrder: 'descending' },
+        createMockContext(),
+      );
+
+      const url = new URL(String(mockFetch.mock.calls[0]?.[0]));
+      expect(url.searchParams.get('max_results')).toBe('5');
+      expect(result.result_limit).toBe(10_000);
+    });
+
     it('uses the mirror for sort-by-submitted when recent-days window is disabled', async () => {
       configOverrides.mirrorRecentDaysLive = 0;
       const ctx = createMockContext();
@@ -511,7 +541,7 @@ describe('ArxivService — mirror integration', () => {
         throw new Error('fts5: syntax error near ":"');
       });
       try {
-        const ctx = createMockContext({ errors: arxivSearch.errors! });
+        const ctx = createMockContext({ errors: arxivSearchPapers.errors! });
         expect.assertions(4);
         try {
           await service.search('language all:automated', { maxResults: 1 }, ctx);
@@ -529,13 +559,13 @@ describe('ArxivService — mirror integration', () => {
       }
     });
 
-    it('surfaces the arxiv_search contract recovery hint for an fts5 failure at the tool boundary', async () => {
+    it('surfaces the arxiv_search_papers contract recovery hint for an fts5 failure at the tool boundary', async () => {
       const spy = vi.spyOn(MirrorStore.prototype, 'search').mockImplementation(() => {
         throw new Error('fts5: syntax error near ":"');
       });
       try {
         initArxivService();
-        const result = await runToolContract(arxivSearch, {
+        const result = await runToolContract(arxivSearchPapers, {
           query: 'language all:automated',
           max_results: 1,
         });
@@ -544,7 +574,9 @@ describe('ArxivService — mirror integration', () => {
         const error = (result.structuredContent as { error: { data: Record<string, unknown> } })
           .error;
         expect(error.data.reason).toBe('unsupported_query_syntax');
-        const declared = arxivSearch.errors!.find((e) => e.reason === 'unsupported_query_syntax');
+        const declared = arxivSearchPapers.errors!.find(
+          (e) => e.reason === 'unsupported_query_syntax',
+        );
         expect(error.data.recovery).toEqual({ hint: declared!.recovery });
       } finally {
         spy.mockRestore();
@@ -776,6 +808,244 @@ describe('ArxivService — mirror integration', () => {
 
         // Both operands survive, AND-ed — the same intersection the mirror applies.
         expect(result.effective_query).toBe('(cat:cs.AI) AND cat:astro-ph*');
+      });
+    });
+
+    // -----------------------------------------------------------------------
+    // Issue #49 — a free-text term matching the cap or more papers goes to the
+    // live API, and only such a term does.
+    // -----------------------------------------------------------------------
+
+    describe('free-text terms at the match cap go to the live API (#49)', () => {
+      const ATOM_AT_CAP = `<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom"
+      xmlns:opensearch="http://a9.com/-/spec/opensearch/1.1/">
+  <opensearch:totalResults>1025313</opensearch:totalResults>
+  <opensearch:startIndex>0</opensearch:startIndex>
+  <entry>
+    <id>http://arxiv.org/abs/2402.99999v1</id>
+    <title>From Live API</title>
+    <summary>Answered by arXiv.</summary>
+    <author><name>Live Author</name></author>
+    <category term="cs.AI" />
+    <published>2024-02-15T00:00:00Z</published>
+    <updated>2024-02-15T00:00:00Z</updated>
+  </entry>
+</feed>`;
+
+      const rateLimited = () =>
+        new Response('Rate exceeded.', { status: 200, headers: { 'content-type': 'text/plain' } });
+
+      /** Write `count` cs.LG papers whose abstract is `term` straight into the mirror file. */
+      async function seedBulk(count: number, term: string): Promise<void> {
+        const { Database } = await import('bun:sqlite');
+        const db = new Database(configOverrides.mirrorPath);
+        db.prepare(
+          `WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < ?)
+           INSERT INTO papers(id, version, title, authors, abstract, primary_category,
+                              categories, published, updated, latest_version)
+           SELECT 'bulk.' || i, '1', 'Bulk paper', 'Bulk Author', ?, 'cs.LG', 'cs.LG',
+                  '2023-06-01T00:00:00.000Z', '2023-06-01T00:00:00.000Z',
+                  '2023-06-01T00:00:00.000Z'
+           FROM n`,
+        ).run(count, term);
+        db.prepare(
+          `INSERT INTO paper_categories(category, paper_id, updated)
+           SELECT 'cs.LG', id, updated FROM papers WHERE id LIKE 'bulk.%'`,
+        ).run();
+        db.close();
+      }
+
+      it.each(['relevance', 'updated', 'submitted'] as const)(
+        'answers a %s-sorted query whose term matches the cap from the live API alone',
+        async (sortBy) => {
+          await seedBulk(50_000, 'ubiquitous');
+          const searchSpy = vi.spyOn(MirrorStore.prototype, 'search');
+          mockFetch.mockResolvedValueOnce(atomResponse(ATOM_AT_CAP));
+          try {
+            const result = await service.search(
+              'ubiquitous',
+              { maxResults: 1, sortBy, sortOrder: 'ascending' },
+              createMockContext(),
+            );
+            expect(mockFetch).toHaveBeenCalledTimes(1);
+            expect(searchSpy).not.toHaveBeenCalled();
+            expect(result.total_results).toBe(1_025_313);
+            expect(result.papers.map((p) => p.id)).toEqual(['2402.99999v1']);
+            expect(result.effective_query).toBe('ubiquitous');
+          } finally {
+            searchSpy.mockRestore();
+          }
+        },
+      );
+
+      it('keeps a term one match under the cap on the mirror, with an exact count', async () => {
+        await seedBulk(49_999, 'ubiquitous');
+        const result = await service.search('ubiquitous', { maxResults: 2 }, createMockContext());
+        expect(mockFetch).not.toHaveBeenCalled();
+        expect(result.total_results).toBe(49_999);
+        expect(result.papers).toHaveLength(2);
+      });
+
+      it('decides on the free-text term alone, before category and date filters narrow it', async () => {
+        await seedBulk(50_000, 'ubiquitous');
+        mockFetch.mockResolvedValueOnce(atomResponse(ATOM_EMPTY));
+        const result = await service.search(
+          'ubiquitous',
+          { maxResults: 1, category: 'astro-ph', submittedFrom: '2023-01-01' },
+          createMockContext(),
+        );
+        expect(mockFetch).toHaveBeenCalledTimes(1);
+        expect(result.total_results).toBe(0);
+      });
+
+      it('surfaces a live failure for a query at the cap instead of answering from the mirror', async () => {
+        await seedBulk(50_000, 'ubiquitous');
+        const searchSpy = vi.spyOn(MirrorStore.prototype, 'search');
+        mockFetch.mockResolvedValue(rateLimited());
+        try {
+          await expect(
+            service.search('ubiquitous', { maxResults: 1 }, createMockContext()),
+          ).rejects.toMatchObject({ code: JsonRpcErrorCode.RateLimited });
+          expect(searchSpy).not.toHaveBeenCalled();
+        } finally {
+          searchSpy.mockRestore();
+        }
+      });
+
+      it('still falls back to the mirror when the recency bypass fails on a query under the cap', async () => {
+        configOverrides.mirrorRecentDaysLive = 2;
+        mockFetch.mockResolvedValue(rateLimited());
+        const result = await service.search(
+          'transformers',
+          { maxResults: 5, sortBy: 'submitted', sortOrder: 'descending' },
+          createMockContext(),
+        );
+        expect(mockFetch).toHaveBeenCalledTimes(1);
+        expect(result.papers.map((p) => p.id)).toEqual(['2401.10001v1']);
+        expect(result.total_results).toBe(1);
+      });
+
+      /** Abort `ctrl` from inside the live request, the way a caller disconnect lands mid-fetch. */
+      const abortDuringFetch = (ctrl: AbortController) =>
+        mockFetch.mockImplementation(() => {
+          ctrl.abort();
+          return Promise.reject(ctrl.signal.reason);
+        });
+
+      it('rethrows a caller cancellation on the recency bypass instead of answering from the mirror', async () => {
+        configOverrides.mirrorRecentDaysLive = 2;
+        const ctrl = new AbortController();
+        abortDuringFetch(ctrl);
+        const probeSpy = vi.spyOn(MirrorStore.prototype, 'matchReachesCap');
+        const searchSpy = vi.spyOn(MirrorStore.prototype, 'search');
+        try {
+          await expect(
+            service.search(
+              'transformers',
+              { maxResults: 5, sortBy: 'submitted', sortOrder: 'descending' },
+              createMockContext({ signal: ctrl.signal }),
+            ),
+          ).rejects.toMatchObject({ name: 'AbortError' });
+          expect(mockFetch).toHaveBeenCalledTimes(1);
+          expect(probeSpy).not.toHaveBeenCalled();
+          expect(searchSpy).not.toHaveBeenCalled();
+        } finally {
+          probeSpy.mockRestore();
+          searchSpy.mockRestore();
+        }
+      });
+
+      it('reports a cancelled recency-bypass search as RequestCancelled at the tool boundary', async () => {
+        configOverrides.mirrorRecentDaysLive = 2;
+        const ctrl = new AbortController();
+        abortDuringFetch(ctrl);
+        initArxivService();
+        const result = await runToolContract(
+          arxivSearchPapers,
+          { query: 'transformers', max_results: 5, sort_by: 'submitted', sort_order: 'descending' },
+          { context: { signal: ctrl.signal } },
+        );
+
+        expect(result.isError, JSON.stringify(result)).toBe(true);
+        const error = (result.structuredContent as { error: { code: number } }).error;
+        expect(error.code).toBe(JsonRpcErrorCode.RequestCancelled);
+      });
+
+      it('surfaces a failed recency bypass for a query at the cap instead of falling back to the mirror', async () => {
+        configOverrides.mirrorRecentDaysLive = 2;
+        await seedBulk(50_000, 'ubiquitous');
+        const searchSpy = vi.spyOn(MirrorStore.prototype, 'search');
+        mockFetch.mockResolvedValue(rateLimited());
+        try {
+          await expect(
+            service.search(
+              'ubiquitous',
+              { maxResults: 1, sortBy: 'submitted', sortOrder: 'descending' },
+              createMockContext(),
+            ),
+          ).rejects.toMatchObject({ code: JsonRpcErrorCode.RateLimited });
+          expect(mockFetch).toHaveBeenCalledTimes(1);
+          expect(searchSpy).not.toHaveBeenCalled();
+        } finally {
+          searchSpy.mockRestore();
+        }
+      });
+
+      it('serves a category-only search from the mirror without probing (#19)', async () => {
+        await seedBulk(50_000, 'ubiquitous');
+        const probeSpy = vi.spyOn(MirrorStore.prototype, 'matchReachesCap');
+        try {
+          const result = await service.search('cat:cs.LG', { maxResults: 1 }, createMockContext());
+          expect(mockFetch).not.toHaveBeenCalled();
+          expect(probeSpy).not.toHaveBeenCalled();
+          // The 50,000 bulk papers plus the seeded cs.LG paper.
+          expect(result.total_results).toBe(50_001);
+        } finally {
+          probeSpy.mockRestore();
+        }
+      });
+
+      it('converts an FTS5 parse error raised by the probe into unsupported_query_syntax', async () => {
+        // The translator emits no malformed expression, so the real probe is
+        // handed one: the error under test is the one SQLite itself raises.
+        const probe = MirrorStore.prototype.matchReachesCap;
+        const probeSpy = vi
+          .spyOn(MirrorStore.prototype, 'matchReachesCap')
+          .mockImplementation(function (this: MirrorStore) {
+            return probe.call(this, 'title:');
+          });
+        try {
+          await expect(
+            service.search('language all:automated', { maxResults: 1 }, createMockContext()),
+          ).rejects.toMatchObject({
+            code: JsonRpcErrorCode.ValidationError,
+            data: { reason: 'unsupported_query_syntax', query: 'language all:automated' },
+          });
+        } finally {
+          probeSpy.mockRestore();
+        }
+      });
+
+      it("reports arXiv's own total through the tool's structured and text output", async () => {
+        await seedBulk(50_000, 'ubiquitous');
+        mockFetch.mockResolvedValueOnce(atomResponse(ATOM_AT_CAP));
+        initArxivService();
+        const result = await runToolContract(arxivSearchPapers, {
+          query: 'ubiquitous',
+          max_results: 1,
+        });
+
+        expect(result.isError, JSON.stringify(result)).toBeFalsy();
+        const structured = result.structuredContent as {
+          papers: { id: string }[];
+          totalFound: number;
+        };
+        expect(structured.totalFound).toBe(1_025_313);
+        expect(structured.papers.map((p) => p.id)).toEqual(['2402.99999v1']);
+        const text = result.content.map((c) => (c.type === 'text' ? c.text : '')).join('\n');
+        expect(text).toContain('1025313');
+        expect(text).toContain('From Live API');
       });
     });
   });
