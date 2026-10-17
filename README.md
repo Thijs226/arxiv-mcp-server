@@ -51,34 +51,28 @@ arXiv papers, metadata, and full text from the arXiv API and its OAI-PMH metadat
 
 ### `arxiv_search_papers` <sub>tool</sub>
 
-- Field prefixes `ti:`, `au:`, `abs:`, `cat:`, `co:` (comment), `jr:` (journal ref), `all:` (all fields); boolean `AND` / `OR` / `ANDNOT`; query capped at 1000 characters
-- `category` accepts a leaf code (`cs.CL`) or a whole archive (`astro-ph`, `cs`, `math`) — a bare archive matches its subject classes plus pre-subdivision legacy papers
-- `sort_by` (`relevance` / `submitted` / `updated`) and `sort_order` (`ascending` / `descending`); up to 50 results per call — a larger `max_results` returns 50, and the truncation notice names the next `start`, or date windows once paging cannot reach every match
-- arXiv serves only the first 10,000 results of a query, so on a search the live API answers, a page that would cross result 10,000 comes back cut short there with the cut disclosed, and a `start` of 10,000 fails `start_beyond_result_limit` without an arXiv request; a search the local mirror answers serves every `start` up to 10,000
-- `submitted_from` / `submitted_to` bound submission date inclusively (UTC `YYYY-MM-DD`); consecutive windows cover matches with no gap — de-duplicate by ID at the seam — the way to reach results past the first 10,000
-- Response enrichment echoes the effective query (every filter folded in, replayable), total match count, and page offset; empty or overshot pages carry recovery guidance instead of an error
+- Query supports field prefixes `ti:`, `au:`, `abs:`, `cat:`, `co:`, `jr:`, `all:` and `AND` / `OR` / `ANDNOT`, up to 1000 characters; `category` takes a code (`cs.CL`) or a whole archive (`astro-ph`, `cs`, `math`)
+- Sorts by `sort_by` (`relevance` / `submitted` / `updated`) and `sort_order`, with `submitted_from` / `submitted_to` as inclusive UTC `YYYY-MM-DD` bounds; up to 50 results per call (a larger `max_results` returns 50)
+- arXiv serves only the first 10,000 results of a query; a `start` of 10,000 fails `start_beyond_result_limit`. Use date windows to go further
+- Output echoes the effective query, total match count, and page offset; empty pages carry recovery guidance instead of an error
 
 ---
 
 ### `arxiv_get_metadata` <sub>tool</sub>
 
-- Takes up to 100 IDs and looks up the first 10 well-formed ones; the rest come back in `remaining_ids`, ready to pass as the next call's `paper_ids`
-- Versioned (`2401.12345v2`), unversioned, and pre-2007 (`hep-th/9901001`, under an archive that issued such IDs) IDs, also with an `arXiv:` prefix or as an arxiv.org `abs` / `pdf` / `html` URL — scheme optional, trailing slash, `?query`, and `#fragment` ignored; uppercase archives and old-style subject classes (`math.GT/0309136`) normalize to the form arXiv answers to
-- A blank lone string fails as an empty ID, the same as a blank array element
-- Partial-batch results: found papers plus a typed `not_found[]` (`not_in_arxiv` / `version_not_in_mirror` / `invalid_id`) for the rest — a malformed ID never reaches arXiv and never fails the whole batch
-- Fails `invalid_id` when no ID is well-formed, `no_match` only when every looked-up ID misses and none remain, and `version_unavailable` when every miss is a mirror-only version gap reachable on the live API
+- Takes up to 100 IDs and looks up the first 10; the rest come back in `remaining_ids` for the next call's `paper_ids`
+- Accepts versioned (`2401.12345v2`), unversioned, and pre-2007 (`hep-th/9901001`) IDs, with an optional `arXiv:` prefix or an arxiv.org `abs` / `pdf` / `html` URL
+- Returns found papers plus a typed `not_found[]` (`not_in_arxiv` / `version_not_in_mirror` / `invalid_id`) for the rest
+- Fails `invalid_id` when no ID is well-formed, `no_match` when every ID misses, and `version_unavailable` when a version is reachable only on the live API
 
 ---
 
 ### `arxiv_read_paper` <sub>tool</sub>
 
-- Tries native arXiv HTML first, then ar5iv, then text extracted from the PDF — the `source` field reports which one answered
-- Cuts the page to the paper's `<article>` (no site header or footer) and collapses MathML to dollar-delimited LaTeX (`$…$` inline, `$$…$$` block) so the character budget targets paper content
-- Returns HTML for HTML sources, with relative figure and link URLs made absolute — the LLM interprets content directly; PDF-extracted bodies are plain text, so prose is reliable but math, tables, and heading structure flatten
-- The first page carries an `outline` of section headings with their offsets — pass an entry's `start` to read that section. Past 200 headings the deepest levels drop out (`outline_omitted_levels`); a single level over 200 keeps its first 200 and `outline_continues_at` names the `start` to read on from
-- `max_characters` defaults to 100,000; pass `null` for the whole paper in one call. A math-heavy body can still run 300KB-1MB+ after cleaning — page with `start` instead
+- Tries arXiv HTML, then ar5iv, then PDF text extraction; the `source` field reports which answered. PDF text is plain, so math, tables, and headings flatten
+- `max_characters` defaults to 100,000 (pass `null` for the whole paper); page with `start`. The first page carries an `outline` of section headings with offsets
 - `paper_id` accepts the same ID spellings as `arxiv_get_metadata`
-- Typed failures: `invalid_id` (not an arXiv ID), `content_unavailable` (no render, no PDF), `pdf_extraction_failed` (PDF has no text layer), `version_unavailable` (version-pinned ID needs the live API)
+- Fails `invalid_id`, `content_unavailable` (no render, no PDF), `pdf_extraction_failed` (no text layer), or `version_unavailable` (version-pinned ID needs the live API)
 
 ---
 
@@ -92,17 +86,15 @@ arXiv papers, metadata, and full text from the arXiv API and its OAI-PMH metadat
 
 ### `arxiv://paper/{paperId}` <sub>resource</sub>
 
-- `paperId` accepts the same ID spellings as `arxiv_get_metadata`, after percent-decoding — same resolution
-- Percent-encode a legacy ID's slash: `arxiv://paper/hep-th%2F9901001`
-- Typed errors: `empty_id`, `invalid_id`, `no_match`, `version_unavailable`
+- `paperId` accepts the same ID spellings as `arxiv_get_metadata`; percent-encode a legacy ID's slash (`arxiv://paper/hep-th%2F9901001`)
+- Fails `empty_id`, `invalid_id`, `no_match`, or `version_unavailable`
 
 ---
 
 ### `arxiv://categories` <sub>resource</sub>
 
-- Full arXiv category taxonomy as `{ categories: [...] }`, one flat array with `code` / `name` / `group` per entry
-- Cacheable for 24h (`cacheHint.ttlMs: 86400000`), public scope
-- No parameters
+- Returns `{ categories: [...] }`, a flat array with `code` / `name` / `group` per entry
+- No parameters; cacheable for 24h
 
 ## Features
 
@@ -110,17 +102,17 @@ Built on [`@cyanheads/mcp-ts-core`](https://github.com/cyanheads/mcp-ts-core): s
 
 arXiv-specific:
 
-- Read-only, no authentication required — arXiv API is free, metadata is CC0
-- Sequential request queue enforcing arXiv's 3-second crawl delay; rate-limit responses (429, or 200 OK with a `Rate exceeded.` body) fail fast with a server-computed cooldown rather than retrying blindly
-- Content fallback chain: `arxiv.org/html` → ar5iv → PDF text extraction, in that order — the `source` field reports which one answered
+- Read-only, no authentication required
+- Request queue enforcing arXiv's 3-second crawl delay; rate-limit responses fail fast with a cooldown
+- Paper text falls back from arXiv HTML to ar5iv to PDF extraction
 - Full arXiv category taxonomy embedded as static data
-- Optional local OAI-PMH metadata mirror (SQLite + FTS5) — opt-in, eliminates rate-limit exposure for `arxiv_search_papers` and `arxiv_get_metadata`. See [Optional: local mirror](#optional-local-mirror)
+- Optional local OAI-PMH metadata mirror (SQLite + FTS5) that removes rate-limit exposure for search and metadata. See [Optional: local mirror](#optional-local-mirror)
 
 Agent-friendly output:
 
-- Provenance on every read — `arxiv_read_paper`'s `source` field names which upstream artifact answered; `arxiv_search_papers` echoes the effective query so results are reproducible
-- Graceful partial failure — `arxiv_get_metadata` returns found papers alongside a typed `not_found[]` reason per miss instead of failing the whole batch
-- Discriminated output contracts — typed `source` and `not_found[].reason` enums let callers branch on data, not string parsing
+- `arxiv_read_paper` names its `source`; `arxiv_search_papers` echoes the effective query
+- `arxiv_get_metadata` returns found papers with a typed `not_found[]` reason per miss
+- Typed `source` and `not_found[].reason` enums let callers branch on data
 
 ## Getting started
 
@@ -224,17 +216,17 @@ All configuration is optional — the server works out of the box with sensible 
 | `ARXIV_REQUEST_DELAY_MS` | Minimum delay between arXiv API requests (ms). | `3000` |
 | `ARXIV_CONTENT_TIMEOUT_MS` | Timeout for paper body fetches — HTML renders and PDF downloads (ms). | `30000` |
 | `ARXIV_API_TIMEOUT_MS` | Timeout for API search/metadata requests (ms). | `15000` |
-| `ARXIV_MIRROR_ENABLED` | Enable the local OAI-PMH metadata mirror for search and metadata. | `false` |
+| `ARXIV_MIRROR_ENABLED` | Enable the local OAI-PMH metadata mirror. | `false` |
 | `ARXIV_MIRROR_PATH` | SQLite path for the mirror. | `./data/arxiv-mirror.db` |
 | `ARXIV_MIRROR_REFRESH_CRON` | UTC cron expression for in-process daily refresh (HTTP mode only). | unset |
-| `ARXIV_MIRROR_FALLBACK_LIVE` | Fall through to live API on local ID-lookup miss. | `true` |
-| `ARXIV_MIRROR_RECENT_DAYS_LIVE` | Positive values route every `sort_by=submitted`, descending query to the live API; `0` disables the bypass. | `2` |
+| `ARXIV_MIRROR_FALLBACK_LIVE` | Fall through to the live API on a local ID-lookup miss. | `true` |
+| `ARXIV_MIRROR_RECENT_DAYS_LIVE` | Positive values send `sort_by=submitted`, descending queries to the live API; `0` disables. | `2` |
 | `ARXIV_MIRROR_OAI_BASE_URL` | arXiv OAI-PMH endpoint base URL. | `https://oaipmh.arxiv.org/oai` |
 | `ARXIV_MIRROR_OAI_REQUEST_DELAY_MS` | Minimum delay between OAI-PMH requests (ms). | `3000` |
-| `ARXIV_MIRROR_REFRESH_TIMEOUT_MS` | Wall-clock budget for one scheduled refresh (ms). The refresh stops starting pages once a worst-case page cycle (about two minutes at the defaults) no longer fits, and the next run resumes where it stopped. | `7200000` |
+| `ARXIV_MIRROR_REFRESH_TIMEOUT_MS` | Time budget for one scheduled refresh (ms). | `7200000` |
 | `MCP_TRANSPORT_TYPE` | Transport: `stdio` or `http`. | `stdio` |
 | `MCP_HTTP_PORT` | Port for HTTP server. | `3010` |
-| `MCP_SESSION_MODE` | `auto`, `stateful`, or `stateless`. The server declares `stateless` in `src/index.ts` — it holds no per-session state — so every run path resolves the same way unless this variable overrides it. | `stateless` |
+| `MCP_SESSION_MODE` | `auto`, `stateful`, or `stateless`. | `stateless` |
 | `MCP_AUTH_MODE` | Auth mode: `none`, `jwt`, or `oauth`. | `none` |
 | `MCP_LOG_LEVEL` | Log level (RFC 5424). | `info` |
 | `OTEL_ENABLED` | Enable [OpenTelemetry instrumentation](https://github.com/cyanheads/mcp-ts-core/tree/main/docs/telemetry) (spans, metrics, completion logs). | `false` |
@@ -281,9 +273,9 @@ export ARXIV_MIRROR_ENABLED=true
 bun run start:http
 ```
 
-Keep it current with `bun run mirror:refresh` (wire to cron/systemd/launchd, or set `ARXIV_MIRROR_REFRESH_CRON` to schedule it in-process in HTTP mode) and check integrity with `bun run mirror:verify`. A refresh that stops early — interrupted, failed, or out of its scheduled budget — resumes from its saved position on the next run, inside a day's records as well as across days. A scheduled refresh that reaches its budget logs that it stopped and will resume, not a failed job. A newer server migrates an existing mirror's schema in place on first open — never a re-harvest — and an upgrade that rebuilds the full-text index makes that first start noticeably slower on a full-corpus mirror; `mirror:verify` reports the schema version and exits non-zero if a migration didn't complete. The index that keeps harvest writes fast arrives with the first `mirror:init` or refresh run after an upgrade, not on open, and takes a few seconds to build on a full-corpus mirror.
+Keep it current with `bun run mirror:refresh` (cron/systemd/launchd, or `ARXIV_MIRROR_REFRESH_CRON` in HTTP mode) and check it with `bun run mirror:verify`. An interrupted refresh resumes from its saved position on the next run. A newer server migrates the mirror's schema in place, with no re-harvest.
 
-FTS5 BM25 ranking differs from arXiv's own relevance ranking, so `sort_by=relevance` returns a different top-K against the mirror than against the live API. Two kinds of search always go to the live API: a `sort_by=submitted`, descending search while `ARXIV_MIRROR_RECENT_DAYS_LIVE` is positive, and a search whose free-text terms alone match 50,000 or more papers, since no mirror search counts or ranks more than 50,000 matches. That cap is checked before category and date filters apply; a category- or date-only search stays on the mirror. When the live API fails on a search over the cap, a rate limit included, the error is returned and the mirror is not tried. The mirror serves only the latest version of each paper — a version-pinned request falls through to the live API. A stale or failed refresh keeps serving the last completed harvest rather than dropping to the live API mid-request.
+Mirror search ranks with FTS5 BM25, so `sort_by=relevance` returns a different top set than the live API. Searches that go to the live API instead: `sort_by=submitted` descending (while `ARXIV_MIRROR_RECENT_DAYS_LIVE` is positive), searches whose free-text terms match 50,000 or more papers, and version-pinned requests (the mirror holds only the latest version).
 
 ### Docker
 
