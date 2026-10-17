@@ -2,10 +2,10 @@
 
 **Server:** arxiv-mcp-server — arXiv academic paper search, metadata retrieval, and full-text reading for LLM agents.
 **Version:** 1.5.4
-**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.13.12`
+**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.13.15`
 **Engines:** Bun ≥1.4.0, Node ≥24.0.0
-**MCP SDK:** `@modelcontextprotocol/server` ^2.2.0
-**Zod:** ^4.6.5
+**MCP SDK:** `@modelcontextprotocol/server` ^2.3.1
+**Zod:** ^4.6.7
 
 > **Read the framework docs first:** `node_modules/@cyanheads/mcp-ts-core/CLAUDE.md` contains the full API reference — builders, Context, error codes, exports, patterns. This file covers server-specific conventions only.
 > **Design doc:** `docs/design.md` has full tool schemas, service design, API reference, and domain decisions.
@@ -49,11 +49,13 @@ Tailor suggestions to what's actually missing or stale — don't recite the full
 - **Read-only, no auth.** All tools are `readOnlyHint: true`. No API keys needed. `MCP_AUTH_MODE: none`.
 - **Rate limiting.** arXiv enforces a 3-second crawl delay between API requests. The `ArxivService` manages an internal request queue. Content fetches (`arxiv.org/html`, `ar5iv`, `arxiv.org/pdf`) hit other hosts and aren't queued — but a 429 from the PDF fetch records the shared cooldown, so a throttle picked up there still slows subsequent API calls.
 - **Rate-limit policy: fail fast, never retry.** A custom `isArxivTransient` predicate on `withRetry` excludes `RateLimited` from the retry set — when arXiv signals throttle (HTTP 429 or 200 OK with `Rate exceeded.` body), we surface the error to the caller in <1s instead of hammering during the throttle window. Both paths report the applied wait as `error.data.cooldownAppliedMs` — the field every `rate_limited` recovery hint points at, since the 200-body path has no header to report; the 429 path additionally passes `Retry-After` through as `error.data.retryAfter`. Only `ServiceUnavailable` is retried (`maxRetries: 1`); `Timeout` is excluded too, since a hung fetch is overwhelmingly throttling at the connection layer. See [#8](https://github.com/cyanheads/arxiv-mcp-server/issues/8), [#9](https://github.com/cyanheads/arxiv-mcp-server/issues/9).
-- **Content fallback.** `arxiv_read_paper` tries native arXiv HTML first (`arxiv.org/html/{id}`), falls back to ar5iv (`ar5iv.labs.arxiv.org/html/{id}`), then to PDF text extraction via the framework's `pdfParser` (`unpdf`). ar5iv returns 307 redirect (not 404) for missing papers — don't follow redirects, treat 3xx as not-found. An ar5iv failure never ends the chain either: a 5xx, network error, or timeout there is held and re-raised only when the PDF rung also comes up empty, so a third-party outage narrows coverage instead of failing the call. The two HTML rungs both run LaTeXML and so fail together; the PDF is the artifact every paper has, which is what makes it worth a third rung. Errors are `content_unavailable` (no render, no PDF) and `pdf_extraction_failed` (PDF has no text layer — scanned/image-only). See [#23](https://github.com/cyanheads/arxiv-mcp-server/issues/23), [#38](https://github.com/cyanheads/arxiv-mcp-server/issues/38).
-- **API quirks.** arXiv API returns HTTP 200 for everything — empty results, not-found IDs, and rate limiting. Rate limiting returns plain text `"Rate exceeded."` (not XML) — check content-type before parsing.
-- **Raw HTML output.** `arxiv_read_paper` strips HTML head/boilerplate, then returns raw paper body HTML — the LLM interprets the content directly. On the `pdf_text` rung the body is plain text and skips both strippers, so `total_characters` equals `body_characters`. `max_characters` (default: 100,000, `null` for the entire body) controls slice size; `start` (default: 0) is the character offset into the cleaned body — together they page through long papers without re-reading the prefix. Keep the bounded default: raw HTML runs 500KB-3MB+ for math-heavy papers, past what most clients accept in one tool result, so an unbounded read is an explicit opt-in, not the default. `body_characters` in the response is the full cleaned length and is the upper bound for `start`. See [#24](https://github.com/cyanheads/arxiv-mcp-server/issues/24).
-- **Query field prefixes mean one thing on both search paths.** `ti:` / `au:` / `abs:` / `co:` / `jr:` route to the five columns of the mirror's FTS5 index; `all:` — like an unprefixed term — spans all five, matching arXiv's own all-fields behavior. `comment` and `journal_ref` joined that index in mirror schema v3, so a prefix added to `FIELD_MAP` must name an indexed column or FTS5 raises `no such column` at query time. A `cat:` operand written inside `query` is expanded through `categorySearchTerm` before the live API sees it, so a bare archive code means its whole subtree whichever backend answers — arXiv matches a bare `cat:cs` literally and returns nothing. A query `cat:` and the `category` parameter stay independent filters that intersect (`store.search` takes category *groups*: OR within a group, AND across them), never one merged OR-set. `MirrorStore.open` migrates an older mirror file in place — v3 drops and rebuilds the FTS index and its three sync triggers, batched by rowid and repeated from the start if interrupted; never a re-harvest, and the triggers must enumerate every indexed column or the index silently drifts from `papers`. See [#36](https://github.com/cyanheads/arxiv-mcp-server/issues/36), [#37](https://github.com/cyanheads/arxiv-mcp-server/issues/37).
-- **Paper ID normalization.** arXiv API always returns versioned IDs (`2401.12345v1`). Inputs accept both versioned and unversioned forms and reach arXiv verbatim — `id_list` and the HTML endpoints honor a version suffix. Resolution is version-aware: an ID pinning `vN` matches only that version (a mirror row at another version is a miss, not a substitute), an unversioned ID matches the latest. Returned `id` fields always include the version, and so do the `pdf_url` / `abstract_url` derived from them — mirror path as well as live. A version-pinned ID the mirror cannot serve is reported as `version_not_in_mirror`, never `not_in_arxiv`.
+- **Content fallback.** `arxiv_read_paper` tries native arXiv HTML first (`arxiv.org/html/{id}`), falls back to ar5iv (`ar5iv.labs.arxiv.org/html/{id}`), then to PDF text extraction via the framework's `pdfParser` (`unpdf`). ar5iv returns 307 redirect (not 404) for missing papers — don't follow redirects, treat 3xx as not-found. When a conversion aborted, ar5iv answers 200 with an empty article and LaTeXML's "Conversion to HTML had a Fatal error" notice; a page whose only text is that notice counts as no render and the chain moves on to the PDF (`isConversionFailurePage`), while a partial render that keeps the notice beside paper text is still served. arxiv.org/html answers a failed conversion with a 404. An ar5iv failure never ends the chain either: a 5xx, network error, or timeout there is held and re-raised only when the PDF rung also comes up empty, so a third-party outage narrows coverage instead of failing the call. The two HTML rungs both run LaTeXML and so fail together; the PDF is the artifact every paper has, which is what makes it worth a third rung. Errors are `content_unavailable` (no render, no PDF) and `pdf_extraction_failed` (PDF has no text layer — scanned/image-only). See [#23](https://github.com/cyanheads/arxiv-mcp-server/issues/23), [#38](https://github.com/cyanheads/arxiv-mcp-server/issues/38), [#54](https://github.com/cyanheads/arxiv-mcp-server/issues/54).
+- **API quirks.** arXiv API returns HTTP 200 for everything — empty results, not-found IDs, and rate limiting. Rate limiting returns plain text `"Rate exceeded."` (not XML) — check content-type before parsing. The one exception is depth: a query request whose `start + max_results` passes 10,000 answers HTTP 500 whatever the total, so the live search path cuts a page at result 10,000 and refuses a `start` at or past it (`start_beyond_result_limit`) before any request; the mirror has no such limit. See [#56](https://github.com/cyanheads/arxiv-mcp-server/issues/56).
+- **Raw HTML output.** `arxiv_read_paper` cuts the page to its `<article>` — through the last `</article>`, so the site header and footer go while appendices and the bibliography stay — strips LaTeXML class/id noise, collapses MathML to LaTeX, and resolves relative `src`/`href`/`data` values against the URL that served the page (`#fragment`, `mailto:`, and absolute values stay as written), then returns the body HTML — the LLM interprets the content directly. On the `pdf_text` rung the body is plain text and skips all of it, so `total_characters` equals `body_characters`. `max_characters` (default: 100,000, `null` for the entire body) controls slice size; `start` (default: 0) is the character offset into the cleaned body — together they page through long papers without re-reading the prefix. Keep the bounded default: a math-heavy body still runs 300KB-1MB+ after cleaning, past what most clients accept in one tool result, so an unbounded read is an explicit opt-in, not the default. `body_characters` in the response is the full cleaned length and is the upper bound for `start`. A read at `start` 0 also returns `outline`: the part/chapter/section/subsection/subsubsection/paragraph/appendix/bibliography headings with the offset of each `<hN>` tag in the cleaned body, `level` from the tag (h2 = 1), at most 200 entries by dropping the deepest level whole (`outline_omitted_levels`) — the shallowest level is never dropped, and when it alone passes 200 its first 200 stay and `outline_continues_at` names the `start` of the first one left out; `[]` for `pdf_text`, absent past the first page. Offsets index the final cleaned body, so any change to the cleaning pass moves them. Every cleaning pass is linear in page length on any input — keep new passes that way. See [#24](https://github.com/cyanheads/arxiv-mcp-server/issues/24), [#43](https://github.com/cyanheads/arxiv-mcp-server/issues/43), [#44](https://github.com/cyanheads/arxiv-mcp-server/issues/44), [#52](https://github.com/cyanheads/arxiv-mcp-server/issues/52).
+- **Query field prefixes mean one thing on both search paths.** `ti:` / `au:` / `abs:` / `co:` / `jr:` route to the five columns of the mirror's FTS5 index; `all:` — like an unprefixed term — spans all five, matching arXiv's own all-fields behavior. `comment` and `journal_ref` joined that index in mirror schema v3, so a prefix added to `FIELD_MAP` must name an indexed column or FTS5 raises `no such column` at query time. A `cat:` operand written inside `query` is expanded through `categorySearchTerm` before the live API sees it, so a bare archive code means its whole subtree whichever backend answers — arXiv matches a bare `cat:cs` literally and returns nothing. A query `cat:` and the `category` parameter stay independent filters that intersect (`store.search` takes category *groups*: OR within a group, AND across them), never one merged OR-set. `MirrorStore.open` migrates an older mirror file in place — v3 drops and rebuilds the FTS index and its three sync triggers, batched by rowid and repeated from the start if interrupted; never a re-harvest, and the triggers must enumerate every indexed column or the index silently drifts from `papers`. Open never builds an index only writers need: the in-process open runs lazily on the request event loop. See [#36](https://github.com/cyanheads/arxiv-mcp-server/issues/36), [#37](https://github.com/cyanheads/arxiv-mcp-server/issues/37).
+- **Mirror harvest: the writer owns its index, its resume point, and its stop.** `runHarvest` — the only writer, behind `mirror:init`, `mirror:refresh`, and the cron's child process — ensures `paper_categories(paper_id)` before its first page (each record write and tombstone cascade looks the junction up by `paper_id`; without it every lookup scans the table). The index is outside the schema version and `MirrorStore.open` never builds it. A run that stopped before draining (`in_progress` or `error` with a saved token) resumes from that resumption token, which holds the position inside a datestamp; otherwise a refresh starts at `from=last_datestamp` (inclusive). A rejected token falls back to the latest checkpointed datestamp, never the run's start. The cron's child stops starting pages once one worst-case page cycle no longer fits in `ARXIV_MIRROR_REFRESH_TIMEOUT_MS`, checkpoints, and exits 0; `runRefreshSubprocess` resolves `drained` / `partial` / `skipped` and rejects only on a real failure, with SIGTERM then SIGKILL at the budget as the backstop. A cancelled signal is always a failure, never a `partial`. See [#39](https://github.com/cyanheads/arxiv-mcp-server/issues/39), [#50](https://github.com/cyanheads/arxiv-mcp-server/issues/50).
+- **Mirror search is bounded by its FTS match set.** Mirror reads run synchronously on the event loop. A search with a free-text term first runs `MirrorStore.matchReachesCap`, a doclist count stopped at `MIRROR_SEARCH_MATCH_CAP` (50,000). At the cap the query goes live for every sort order, and a live failure on it is returned, never answered from the mirror (the recency-bypass `catch` included). That `catch` also rethrows a caller cancellation for every query: a cancelled call is never answered from the mirror. Under the cap, `store.search` drives the count and the page from `papers_fts` (`CROSS JOIN` keeps the index as the outer loop) and ranks relevance by BM25 with a rowid tiebreak. Never reintroduce a `papers.rowid IN (… MATCH ?)` shape: the count and the page must stay FTS-driven for the cap to bound them. Category- and date-only searches skip the probe and keep their index-backed paths. See [#19](https://github.com/cyanheads/arxiv-mcp-server/issues/19), [#49](https://github.com/cyanheads/arxiv-mcp-server/issues/49).
+- **Paper ID normalization.** arXiv API always returns versioned IDs (`2401.12345v1`). Every ID input — `arxiv_get_metadata`, `arxiv_read_paper`, and `arxiv://paper/{paperId}` after percent-decoding — goes through `normalizePaperId` (`src/services/arxiv/paper-id.ts`) before any request: an `arXiv:` prefix is stripped, an arxiv.org `abs`/`pdf`/`html` URL yields its ID (scheme optional; a trailing slash, `?query`, or `#fragment` is ignored), the archive and `v` are lowercased, and an old-style subject class is dropped (`math.GT/0309136` → `math/0309136`). An old-style ID must name one of the archives that issued them (`LEGACY_ARCHIVES`) — arXiv answers HTTP 400 for a whole `id_list` holding any other. Anything else fails `invalid_id` without reaching arXiv — in `arxiv_get_metadata` a malformed ID is a per-ID `not_found` entry, and the call fails only when no ID is well-formed. The canonical ID reaches `id_list` and the HTML endpoints, which honor a version suffix. `paper_ids` advertises a plain array: its preprocess takes a lone string as the one ID (trimmed, so a trailing line break still resolves, and a blank one fails as the empty ID it is, never with the send-an-array hint) and leaves a JSON string or one with a comma or inner line break to the framework, which decodes a stringified array and refuses the rest. It takes up to 100 IDs, looks up the first 10 well-formed ones, and names the rest in `remaining_ids`. See [#41](https://github.com/cyanheads/arxiv-mcp-server/issues/41), [#51](https://github.com/cyanheads/arxiv-mcp-server/issues/51). Resolution is version-aware: an ID pinning `vN` matches only that version (a mirror row at another version is a miss, not a substitute), an unversioned ID matches the latest. Returned `id` fields always include the version, and so do the `pdf_url` / `abstract_url` derived from them — mirror path as well as live. A version-pinned ID the mirror cannot serve is reported as `version_not_in_mirror`, never `not_in_arxiv`.
 - **Dependencies:** `fast-xml-parser` (v5, class-based API) for Atom XML parsing. No HTML parsing library needed. `unpdf` is a direct dependency only because the framework's `pdfParser` lazy-loads it as an optional peer — the version range mirrors mcp-ts-core's declared peer floor; never call `unpdf` directly.
 
 ---
@@ -67,7 +69,7 @@ import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { getArxivService } from '@/services/arxiv/arxiv-service.js';
 
-export const arxivSearch = tool('arxiv_search', {
+export const arxivSearchPapers = tool('arxiv_search_papers', {
   description: 'Search arXiv papers by query with category and sort filters.',
   annotations: { readOnlyHint: true },
 
@@ -79,7 +81,7 @@ export const arxivSearch = tool('arxiv_search', {
 
   input: z.object({
     query: z.string().describe('Search query with field prefixes: ti:, au:, abs:, cat:, all:. Boolean: AND, OR, ANDNOT.'),
-    max_results: z.number().min(1).max(50).default(10).describe('Maximum results to return (1-50).'),
+    max_results: z.number().int().min(1).max(10_000).default(10).describe('Maximum results to return; at most 50 per call.'),
   }),
   output: z.object({
     total_results: z.number().describe('Total matching papers.'),
@@ -88,7 +90,7 @@ export const arxivSearch = tool('arxiv_search', {
 
   async handler(input, ctx) {
     const service = getArxivService();
-    const result = await service.search(input.query, { maxResults: input.max_results }, ctx);
+    const result = await service.search(input.query, { maxResults: Math.min(input.max_results, 50) }, ctx);
     ctx.log.info('Search completed', { query: input.query, count: result.papers.length });
     return result;
   },
@@ -115,7 +117,7 @@ export const paperResource = resource('arxiv://paper/{paperId}', {
   errors: [
     { reason: 'no_match', code: JsonRpcErrorCode.NotFound,
       when: 'Paper ID is not present in the arXiv index.',
-      recovery: 'Verify the paper ID format and confirm via arxiv_search before retrying.' },
+      recovery: 'Verify the paper ID format and confirm via arxiv_search_papers before retrying.' },
   ],
   async handler(params, ctx) {
     const service = getArxivService();
@@ -206,7 +208,7 @@ Handlers throw — the framework catches, classifies, and formats. Recommended p
 errors: [
   { reason: 'no_match', code: JsonRpcErrorCode.NotFound,
     when: 'Requested paper ID is not present in the arXiv index.',
-    recovery: 'Verify the paper ID format and confirm via arxiv_search before retrying.' },
+    recovery: 'Verify the paper ID format and confirm via arxiv_search_papers before retrying.' },
 ],
 async handler(input, ctx) {
   const result = await service.getPapers([input.paper_id], ctx);
@@ -275,13 +277,14 @@ src/
   services/
     arxiv/
       arxiv-service.ts                  # ArxivService — search, getPapers, readContent
+      paper-id.ts                       # normalizePaperId — the parser every ID input runs through
       types.ts                          # PaperMetadata, SearchResult, PaperContent types
       categories.ts                     # Static arXiv category taxonomy (~155 categories)
   mcp-server/
     tools/definitions/
-      arxiv-search.tool.ts              # arxiv_search — query search with filters
+      arxiv-search-papers.tool.ts       # arxiv_search_papers — query search with filters
       arxiv-get-metadata.tool.ts        # arxiv_get_metadata — lookup by ID(s)
-      arxiv-read-paper.tool.ts          # arxiv_read_paper — raw HTML content
+      arxiv-read-paper.tool.ts          # arxiv_read_paper — full text (HTML or PDF) + outline
       arxiv-list-categories.tool.ts     # arxiv_list_categories — category taxonomy
     resources/definitions/
       paper.resource.ts                 # arxiv://paper/{paperId}
@@ -294,8 +297,8 @@ src/
 
 | What | Convention | Example |
 |:-----|:-----------|:--------|
-| Files | kebab-case with suffix | `arxiv-search.tool.ts` |
-| Tool/resource/prompt names | snake_case | `arxiv_search` |
+| Files | kebab-case with suffix | `arxiv-search-papers.tool.ts` |
+| Tool/resource/prompt names | snake_case | `arxiv_search_papers` |
 | Directories | kebab-case | `src/services/arxiv/` |
 | Descriptions | Single string or template literal, no `+` concatenation | `'Search arXiv papers by query.'` |
 
