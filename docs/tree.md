@@ -1,6 +1,6 @@
 # arxiv-mcp-server - Directory Structure
 
-Generated on: 2026-10-05 06:17:37
+Generated on: 2026-10-17 20:24:33
 
 ```text
 arxiv-mcp-server/
@@ -29,6 +29,7 @@ arxiv-mcp-server/
 │   ├── 1.3.x/
 │   ├── 1.4.x/
 │   ├── 1.5.x/
+│   ├── 1.6.x/
 │   └── template.md
 ├── claude-plans/
 ├── dev-logs/
@@ -161,7 +162,7 @@ arxiv-mcp-server/
 │   │           ├── arxiv-get-metadata.tool.ts
 │   │           ├── arxiv-list-categories.tool.ts
 │   │           ├── arxiv-read-paper.tool.ts
-│   │           ├── arxiv-search.tool.ts
+│   │           ├── arxiv-search-papers.tool.ts
 │   │           └── index.ts
 │   ├── services/
 │   │   └── arxiv/
@@ -178,9 +179,19 @@ arxiv-mcp-server/
 │   │       ├── arxiv-service.ts
 │   │       ├── categories.ts
 │   │       ├── date-window.ts
+│   │       ├── paper-id.ts
 │   │       └── types.ts
 │   └── index.ts
 ├── tests/
+│   ├── fixtures/
+│   │   └── arxiv-html/
+│   │       ├── ar5iv-1706.03762v7.html.gz
+│   │       ├── ar5iv-hep-th_9711200v3.html.gz
+│   │       ├── ar5iv-math_9201201v1.html.gz
+│   │       ├── native-1706.03762v7.html.gz
+│   │       ├── native-2405.03599v3-headings.html.gz
+│   │       ├── native-astro-ph_0603449v2-headings.html.gz
+│   │       └── native-math_9201201v1.html.gz
 │   ├── mcp-server/
 │   │   ├── resources/
 │   │   │   └── definitions/
@@ -192,7 +203,7 @@ arxiv-mcp-server/
 │   │   │       ├── arxiv-get-metadata.tool.test.ts
 │   │   │       ├── arxiv-list-categories.tool.test.ts
 │   │   │       ├── arxiv-read-paper.tool.test.ts
-│   │   │       ├── arxiv-search.tool.test.ts
+│   │   │       ├── arxiv-search-papers.tool.test.ts
 │   │   │       ├── input-validation.test.ts
 │   │   │       └── security.test.ts
 │   │   ├── error-envelope.test.ts
@@ -206,12 +217,14 @@ arxiv-mcp-server/
 │           │   ├── parity.test.ts
 │           │   ├── query.test.ts
 │           │   ├── refresh-subprocess.test.ts
+│           │   ├── runner.test.ts
 │           │   └── store.test.ts
 │           ├── arxiv-service-errors.test.ts
 │           ├── arxiv-service-mirror.test.ts
 │           ├── arxiv-service.test.ts
 │           ├── categories.test.ts
 │           ├── date-window.test.ts
+│           ├── paper-id.test.ts
 │           ├── types-extra.test.ts
 │           └── types.test.ts
 ├── .dockerignore

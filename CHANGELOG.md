@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [1.6.0](changelog/1.6.x/1.6.0.md) — 2026-10-17 · ⚠️ Breaking
+
+Renames arxiv_search to arxiv_search_papers (no alias), adds a section outline to arxiv_read_paper, runs every ID input through one parser, and bounds mirror searches and refreshes. Adopts mcp-ts-core ^0.13.15.
+
 ## [1.5.4](changelog/1.5.x/1.5.4.md) — 2026-10-04
 
 Adopts mcp-ts-core 0.13.7–0.13.12 — tool errors carry a request id, declared recovery hints reach callers without per-throw forwarding, an integer sent for a string parameter is accepted, and the Docker image builds multi-arch without emulation.
