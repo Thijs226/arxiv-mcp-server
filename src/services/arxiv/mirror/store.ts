@@ -21,8 +21,20 @@ import { mkdir } from 'node:fs/promises';
 import { dirname, resolve as resolvePath } from 'node:path';
 import { databaseError } from '@cyanheads/mcp-ts-core/errors';
 import { runtimeCaps } from '@cyanheads/mcp-ts-core/utils';
-import { MIRROR_FTS_SQL, MIRROR_SCHEMA_SQL, MIRROR_SCHEMA_VERSION } from './schema.js';
+import {
+  MIRROR_FTS_SQL,
+  MIRROR_SCHEMA_SQL,
+  MIRROR_SCHEMA_VERSION,
+  MIRROR_WRITE_INDEX_SQL,
+} from './schema.js';
 import type { ArxivRawRecord, HarvestState, PaperRow } from './types.js';
+
+/**
+ * Most FTS matches a mirror search will count and rank (issue #49). A free-text
+ * term that reaches this many papers is answered by the live API instead — see
+ * {@link MirrorStore.matchReachesCap}.
+ */
+export const MIRROR_SEARCH_MATCH_CAP = 50_000;
 
 /**
  * Runtime-agnostic prepared statement. Matches the intersection of
@@ -210,6 +222,16 @@ export class MirrorStore {
   // -------------------------------------------------------------------------
 
   /**
+   * Ensure the write-path index on `paper_categories(paper_id)` exists (issue
+   * #50). A no-op when it already does; the first call on a full-corpus mirror
+   * builds it in one pass over the junction. Called by the harvest runner, never
+   * by {@link MirrorStore.open} — see `MIRROR_WRITE_INDEX_SQL`.
+   */
+  ensureWriteIndex(): void {
+    this.db.exec(MIRROR_WRITE_INDEX_SQL);
+  }
+
+  /**
    * Batch upsert records inside a single transaction. Tombstones are deleted
    * by paper ID; live records replace existing rows (FTS triggers handle sync).
    * Also maintains the `paper_categories` junction table.
@@ -296,12 +318,34 @@ export class MirrorStore {
   }
 
   /**
+   * Bounded probe: whether `matchExpr` matches at least
+   * {@link MIRROR_SEARCH_MATCH_CAP} papers. Stops at that many matches and never
+   * touches `papers`. Category and date filters play no part — the cost a
+   * search incurs is set by the FTS match set they would narrow. A malformed
+   * expression raises the same `fts5:` error {@link MirrorStore.search} would.
+   */
+  matchReachesCap(matchExpr: string): boolean {
+    const row = this.db
+      .prepare<{ n: number }>(
+        `SELECT COUNT(*) AS n FROM (SELECT 1 FROM papers_fts WHERE papers_fts MATCH ? LIMIT ?)`,
+      )
+      .get(matchExpr, MIRROR_SEARCH_MATCH_CAP);
+    return (row?.n ?? 0) >= MIRROR_SEARCH_MATCH_CAP;
+  }
+
+  /**
    * Execute an FTS5 + filter search. The translator (`query.ts`) is responsible
    * for producing a `matchExpr` that parses against FTS5 for every input the
    * arXiv-syntax lexer accepts — specifically, it inserts explicit `AND` at any
    * boundary where implicit conjunction would cross a parenthesized form
    * (see issue #13). Callers still wrap this in a SQLite-error catch for
    * defense in depth — see `ArxivService.searchMirror`.
+   *
+   * With a `matchExpr`, both the count and the page are driven from the FTS
+   * index, so their cost follows the match set rather than the corpus; callers
+   * bound that set first with {@link MirrorStore.matchReachesCap} (issue #49).
+   * Relevance order is BM25 (best first; `sortOrder` does not apply), with rowid
+   * breaking ties so pages never overlap.
    *
    * `categoryGroups` holds expanded category codes (subtree expansion handled
    * upstream), matched via the `paper_categories` junction table (index-backed —
@@ -333,15 +377,10 @@ export class MirrorStore {
     const dir = options.sortOrder === 'ascending' ? 'ASC' : 'DESC';
 
     // -------------------------------------------------------------------------
-    // Build the WHERE clause for the papers table.
+    // Build the filters on `papers` columns, shared by every search shape.
     // -------------------------------------------------------------------------
     const papersParams: unknown[] = [];
     const papersWhere: string[] = [];
-
-    if (options.matchExpr) {
-      papersWhere.push(`papers.rowid IN (SELECT rowid FROM papers_fts WHERE papers_fts MATCH ?)`);
-      papersParams.push(options.matchExpr);
-    }
 
     // Category filtering via the junction table: index-backed exact match. One
     // subquery per group, AND-ed by the surrounding WHERE — a paper matches when
@@ -363,17 +402,83 @@ export class MirrorStore {
       papersParams.push(options.publishedTo);
     }
 
+    const columns = `papers.id, papers.version, papers.title, papers.authors,
+             papers.abstract, papers.primary_category, papers.categories,
+             papers.published, papers.updated, papers.latest_version,
+             papers.comment, papers.journal_ref, papers.doi`;
+
+    // -------------------------------------------------------------------------
+    // FTS term: count and page both enumerate the match set from the index
+    // (issue #49). CROSS JOIN pins `papers_fts` as the outer loop, so each match
+    // costs one rowid lookup into `papers` and the filters run per match.
+    // `rank` / `bm25()` score only on the cursor the MATCH constrains.
+    // -------------------------------------------------------------------------
+    if (options.matchExpr) {
+      const from = `FROM papers_fts CROSS JOIN papers ON papers.rowid = papers_fts.rowid`;
+      const where = `WHERE ${['papers_fts MATCH ?', ...papersWhere].join(' AND ')}`;
+      const params = [options.matchExpr, ...papersParams];
+      const orderBy =
+        options.sortBy === 'published'
+          ? `papers.published ${dir}`
+          : options.sortBy === 'updated'
+            ? `papers.updated ${dir}`
+            : 'papers_fts.rank';
+      // Every page query sorts rowids only; columns are read for the page it keeps.
+      const pageOrder = `ORDER BY ${orderBy}, papers.rowid LIMIT ? OFFSET ?`;
+
+      if (papersWhere.length === 0) {
+        // Nothing to filter: the index alone gives the count and the BM25 order
+        // — every indexed rowid is a `papers` row, kept so by the sync triggers —
+        // so neither reads a `papers` row per match.
+        const totalRow = this.db
+          .prepare<{ n: number }>(`SELECT COUNT(*) AS n FROM papers_fts WHERE papers_fts MATCH ?`)
+          .get(options.matchExpr);
+        const pageSql =
+          options.sortBy === 'relevance'
+            ? `SELECT rowid AS rid FROM papers_fts WHERE papers_fts MATCH ?
+               ORDER BY rank, rowid LIMIT ? OFFSET ?`
+            : `SELECT papers.rowid AS rid ${from} ${where} ${pageOrder}`;
+        const rowids = this.db
+          .prepare<{ rid: number }>(pageSql)
+          .all(...params, options.limit, options.offset)
+          .map((r) => r.rid);
+        return { papers: this.getPapersByRowids(rowids, columns), total: totalRow?.n ?? 0 };
+      }
+
+      // A filter reads each match's `papers` row, so count and page share that
+      // one pass: the window counts every surviving row before LIMIT cuts the page.
+      const page = this.db
+        .prepare<{ n: number; rid: number }>(
+          `SELECT papers.rowid AS rid, COUNT(*) OVER () AS n ${from} ${where} ${pageOrder}`,
+        )
+        .all(...params, options.limit, options.offset);
+      // An offset past the end leaves no row to carry the count; count alone.
+      const total =
+        page[0]?.n ??
+        (options.offset === 0
+          ? 0
+          : (this.db.prepare<{ n: number }>(`SELECT COUNT(*) AS n ${from} ${where}`).get(...params)
+              ?.n ?? 0));
+      return {
+        papers: this.getPapersByRowids(
+          page.map((r) => r.rid),
+          columns,
+        ),
+        total,
+      };
+    }
+
     const whereClause = papersWhere.length > 0 ? `WHERE ${papersWhere.join(' AND ')}` : '';
 
     // -------------------------------------------------------------------------
     // COUNT — the single-group category-only path uses a direct junction query
-    // to avoid a full papers-table scan (issue #19). Every other shape (an FTS
-    // term, a date window, or a second category group to intersect against)
-    // takes the generic papers-table COUNT below.
+    // to avoid a full papers-table scan (issue #19). Every other shape (a date
+    // window, or a second category group to intersect against) takes the
+    // generic papers-table COUNT below.
     // -------------------------------------------------------------------------
     const soleGroup = groups.length === 1 ? groups[0] : undefined;
     let total: number;
-    if (soleGroup && !options.matchExpr && !hasDateWindow) {
+    if (soleGroup && !hasDateWindow) {
       // Pure category filter: COUNT directly on the junction, which is indexed
       // on category. Multiple categories → UNION on primary keys (no dups).
       if (soleGroup.length === 1) {
@@ -405,26 +510,17 @@ export class MirrorStore {
     // -------------------------------------------------------------------------
     // Row page.
     //
-    // Fast path: exactly one category, no FTS term, no date window, not sorted
-    // by published. This covers the dominant category-browse shape (default and
-    // updated sorts both order by `updated`). It pages straight off the
-    // (category, updated) junction index — no sort, no papers scan — so it stays
-    // fast for rare categories too, not just common ones (issue #19). Every
-    // other shape (multiple categories, a second category group, an FTS term, a
-    // date window, or sort_by:published) takes the generic papers-table path
-    // below, which is the only one that applies `whereClause`.
+    // Fast path: exactly one category, no date window, not sorted by published.
+    // This covers the dominant category-browse shape (default and updated sorts
+    // both order by `updated`). It pages straight off the (category, updated)
+    // junction index — no sort, no papers scan — so it stays fast for rare
+    // categories too, not just common ones (issue #19). Every other shape
+    // (multiple categories, a second category group, a date window, or
+    // sort_by:published) takes the generic papers-table path below, which is the
+    // only one that applies `whereClause`.
     // -------------------------------------------------------------------------
-    const columns = `papers.id, papers.version, papers.title, papers.authors,
-             papers.abstract, papers.primary_category, papers.categories,
-             papers.published, papers.updated, papers.latest_version,
-             papers.comment, papers.journal_ref, papers.doi`;
-
     const singleCat =
-      soleGroup &&
-      !options.matchExpr &&
-      !hasDateWindow &&
-      soleGroup.length === 1 &&
-      options.sortBy !== 'published'
+      soleGroup && !hasDateWindow && soleGroup.length === 1 && options.sortBy !== 'published'
         ? soleGroup[0]
         : undefined;
 
@@ -451,20 +547,13 @@ export class MirrorStore {
           orderBy = `ORDER BY papers.updated ${dir}`;
           break;
         default:
-          orderBy = options.matchExpr
-            ? `ORDER BY bm25(papers_fts) ASC`
-            : `ORDER BY papers.updated DESC`;
+          // No term to rank by: relevance reduces to newest-updated first.
+          orderBy = `ORDER BY papers.updated DESC`;
       }
-
-      // bm25() needs the FTS5 table reference; only valid when matchExpr is present.
-      const ftsJoin =
-        options.matchExpr && options.sortBy === 'relevance'
-          ? `JOIN papers_fts ON papers.rowid = papers_fts.rowid`
-          : '';
 
       const rowsSql = `
         SELECT ${columns}
-        FROM papers ${ftsJoin}
+        FROM papers
         ${whereClause}
         ${orderBy}
         LIMIT ? OFFSET ?
@@ -472,6 +561,19 @@ export class MirrorStore {
       rows = this.db.prepare<PaperRow>(rowsSql).all(...papersParams, options.limit, options.offset);
     }
     return { papers: rows, total };
+  }
+
+  /** Read `columns` for a page of rowids, in the order given. */
+  private getPapersByRowids(rowids: number[], columns: string): PaperRow[] {
+    if (rowids.length === 0) return [];
+    const rows = this.db
+      .prepare<PaperRow & { rid: number }>(
+        `SELECT papers.rowid AS rid, ${columns} FROM papers
+         WHERE papers.rowid IN (${rowids.map(() => '?').join(',')})`,
+      )
+      .all(...rowids);
+    const byRowid = new Map(rows.map(({ rid, ...row }) => [rid, row]));
+    return rowids.map((rid) => byRowid.get(rid)).filter((r): r is PaperRow => r !== undefined);
   }
 
   // -------------------------------------------------------------------------

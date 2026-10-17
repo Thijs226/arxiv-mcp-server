@@ -20,9 +20,11 @@ const ServerConfigSchema = z.object({
   mirrorRecentDaysLive: z.coerce.number().min(0).default(2),
   mirrorOaiBaseUrl: z.string().default('https://oaipmh.arxiv.org/oai'),
   mirrorOaiRequestDelayMs: z.coerce.number().min(0).default(3000),
-  // Wall-clock budget for one in-process refresh subprocess before it is
-  // aborted (ms). Default 2h: a nightly delta is small, but arXiv's OAI-PMH
-  // endpoint can be slow per page, so the cap is generous. See issue #22.
+  // Wall-clock budget for one in-process refresh subprocess (ms). The child
+  // stops starting pages once a worst-case page cycle no longer fits, exits
+  // cleanly, and the next run resumes from its checkpoint; SIGTERM, then
+  // SIGKILL, at the budget are only the backstop for a child that overruns.
+  // Default 2h. See issues #22, #39.
   mirrorRefreshTimeoutMs: z.coerce.number().min(0).default(7_200_000),
 });
 

@@ -4,7 +4,7 @@
  * The harvest's SQLite writes — `applyBatch()` per page plus the closing
  * `SELECT COUNT(*)` — are synchronous and uncancellable (both `bun:sqlite` and
  * `better-sqlite3` are synchronous drivers), so running them on the HTTP
- * server's event loop stalls `arxiv_search` / `arxiv_get_metadata` for the
+ * server's event loop stalls `arxiv_search_papers` / `arxiv_get_metadata` for the
  * harvest's duration. This module runs the refresh in a child process spawned
  * via `process.execPath`; the child opens its own SQLite connection and does
  * all synchronous work there, while WAL lets the server's reader connection
@@ -17,6 +17,14 @@
  *     as the child entry point — the bottom guard runs one refresh and exits.
  *     This is what {@link runRefreshSubprocess} spawns.
  *
+ * The child owns its stop (issue #39). `mirrorRefreshTimeoutMs` is the
+ * wall-clock budget measured from the child's start; the child stops starting
+ * pages once one worst-case page cycle no longer fits inside it, finishes the
+ * page in hand, checkpoints, reports `drained` or `partial` on its last stdout
+ * line, and exits 0. The next run resumes from that checkpoint. The parent's
+ * SIGTERM at the budget, and SIGKILL after {@link SIGKILL_GRACE_MS}, remain
+ * only as the backstop for a child that overruns its deadline.
+ *
  * @module services/arxiv/mirror/refresh-subprocess
  */
 
@@ -24,12 +32,30 @@ import { type ChildProcess, spawn } from 'node:child_process';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { getServerConfig } from '@/config/server-config.js';
-import { type MirrorLogger, runHarvest } from './runner.js';
+import { type HarvestResult, type MirrorLogger, runHarvest } from './runner.js';
 
 type LogLevel = 'debug' | 'info' | 'notice' | 'warning' | 'error';
 
 /** Grace period after SIGTERM before escalating to SIGKILL (ms). */
 const SIGKILL_GRACE_MS = 30_000;
+
+/** Counts and checkpoint a finished refresh reports. */
+export type RefreshCounts = Omit<HarvestResult, 'drained'>;
+
+/**
+ * How one scheduled refresh ended without failing: the OAI list `drained`,
+ * the run `partial`ly applied it and stopped at its deadline, or the tick was
+ * `skipped` because a refresh was already running.
+ */
+export type RefreshOutcome =
+  | { outcome: 'skipped' }
+  | ({ outcome: 'drained' } & RefreshCounts)
+  | ({ outcome: 'partial' } & RefreshCounts);
+
+type FinishedOutcome = Exclude<RefreshOutcome, { outcome: 'skipped' }>;
+
+/** `msg` of the child's final stdout line, which carries its {@link RefreshOutcome}. */
+const OUTCOME_MSG = 'Mirror refresh outcome';
 
 /**
  * Tracks the in-flight refresh child so overlapping cron ticks (or a tick that
@@ -42,33 +68,37 @@ let activeChild: ChildProcess | undefined;
 // ---------------------------------------------------------------------------
 
 /**
- * Spawn one incremental mirror refresh in a child process and resolve when it
- * exits cleanly. Rejects on spawn failure, non-zero exit, or a timeout kill, so
- * a harvest that never finished isn't indistinguishable from one that did —
- * `SchedulerService.schedule` catches the rejection and logs the tick as failed
- * without crashing the server, which is the "a cron tick can't crash the
- * server" backstop. A no-op (with a warning) when a refresh is already running.
+ * Spawn one incremental mirror refresh in a child process and resolve with its
+ * outcome once it exits 0: `drained` (logged at info) or `partial` — stopped at
+ * its deadline with a checkpoint the next run resumes from (logged at notice).
+ * Resolves `skipped`, with a warning and no spawn, when a refresh is already
+ * running.
  *
- * @param opts.timeoutMs - Wall-clock budget. On overrun the child gets SIGTERM,
- *   then SIGKILL after {@link SIGKILL_GRACE_MS} — synchronous SQLite can't be
- *   interrupted by a signal mid-statement, so the hard kill is the real backstop.
+ * Rejects on spawn failure, a child `error` event, a non-zero exit, a timeout
+ * kill, or an exit 0 that reported no outcome, so a harvest that never finished
+ * isn't indistinguishable from one that did — `SchedulerService.schedule`
+ * catches the rejection and logs the tick as failed without crashing the
+ * server. See issue #31.
+ *
+ * @param opts.timeoutMs - Wall-clock budget. The child stops itself inside it;
+ *   one that overruns gets SIGTERM at the budget, then SIGKILL after
+ *   {@link SIGKILL_GRACE_MS} — synchronous SQLite can't be interrupted by a
+ *   signal mid-statement, so the hard kill is the real backstop.
  * @param opts.log - Logger for lifecycle events and forwarded child output.
- * @throws {Error} When the child fails to spawn, errors, exits non-zero, or is
- *   killed on timeout. See issue #31.
  */
 export function runRefreshSubprocess(opts: {
   timeoutMs: number;
   log: MirrorLogger;
-}): Promise<void> {
+}): Promise<RefreshOutcome> {
   const { timeoutMs, log } = opts;
   if (activeChild) {
     log.warning?.('Mirror refresh already running; skipping this tick');
-    return Promise.resolve();
+    return Promise.resolve({ outcome: 'skipped' });
   }
 
   const entry = fileURLToPath(new URL('./refresh-subprocess.js', import.meta.url));
 
-  return new Promise<void>((resolvePromise, rejectPromise) => {
+  return new Promise<RefreshOutcome>((resolvePromise, rejectPromise) => {
     let child: ChildProcess;
     try {
       child = spawn(process.execPath, [entry], {
@@ -88,11 +118,17 @@ export function runRefreshSubprocess(opts: {
     }
 
     activeChild = child;
-    log.info?.('Mirror refresh subprocess started', { pid: child.pid, timeoutMs });
+    log.info?.('Mirror refresh subprocess started', { childPid: child.pid, timeoutMs });
 
     // The child emits one JSON object per stdout line; re-log at the matching
     // level so harvest detail flows through the server's structured logger.
-    forwardLines(child.stdout, (line) => relayChildLine(log, line));
+    // Its final line carries the outcome and is kept rather than relayed.
+    let reported: FinishedOutcome | undefined;
+    forwardLines(child.stdout, (line) => {
+      const outcome = parseOutcomeLine(line);
+      if (outcome) reported = outcome;
+      else relayChildLine(log, line);
+    });
     forwardLines(child.stderr, (line) => log.error?.(line));
 
     let timedOut = false;
@@ -108,22 +144,34 @@ export function runRefreshSubprocess(opts: {
       }
     }, timeoutMs + SIGKILL_GRACE_MS);
 
-    const settle = (failure?: Error) => {
+    // A failed spawn can emit both `error` and `close`; the first one decides.
+    let settled = false;
+    const settle = (result: FinishedOutcome | Error) => {
+      if (settled) return;
+      settled = true;
       clearTimeout(sigterm);
       clearTimeout(sigkill);
       activeChild = undefined;
-      if (failure) rejectPromise(failure);
-      else resolvePromise();
+      if (result instanceof Error) rejectPromise(result);
+      else resolvePromise(result);
     };
 
     child.on('error', (err) => {
       log.error?.('Mirror refresh subprocess error', { error: err.message });
       settle(new Error(`Mirror refresh subprocess error: ${err.message}`, { cause: err }));
     });
-    child.on('exit', (code, signal) => {
+    // `close`, not `exit`: it fires after the child's stdio has drained, so the
+    // outcome line has been read by the time the exit code is.
+    child.on('close', (code, signal) => {
+      if (settled) return;
       if (code === 0) {
-        log.info?.('Mirror refresh subprocess completed', { code });
-        settle();
+        if (!reported) {
+          log.error?.('Mirror refresh subprocess exited without reporting an outcome');
+          settle(new Error('Mirror refresh subprocess exited 0 without reporting an outcome'));
+          return;
+        }
+        logOutcome(log, reported);
+        settle(reported);
         return;
       }
       if (timedOut) {
@@ -139,6 +187,26 @@ export function runRefreshSubprocess(opts: {
       settle(new Error(`Mirror refresh subprocess exited with code ${code} (signal ${signal})`));
     });
   });
+}
+
+/** Log a finished refresh: info when the list drained, notice when it stopped at its deadline. */
+function logOutcome(log: MirrorLogger, { outcome, ...counts }: FinishedOutcome): void {
+  if (outcome === 'drained') log.info?.('Mirror refresh drained', counts);
+  else log.notice?.('Mirror refresh stopped at its deadline; the next run resumes', counts);
+}
+
+/** The outcome carried by the child's final stdout line, or `undefined` for any other line. */
+function parseOutcomeLine(line: string): FinishedOutcome | undefined {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(line);
+  } catch {
+    return;
+  }
+  if (typeof parsed !== 'object' || parsed === null) return;
+  const { level: _level, msg, ...rest } = parsed as Record<string, unknown>;
+  if (msg !== OUTCOME_MSG || (rest.outcome !== 'drained' && rest.outcome !== 'partial')) return;
+  return rest as FinishedOutcome;
 }
 
 /** Forward a child stream's complete lines to `sink`, holding a partial tail across chunks. */
@@ -201,25 +269,37 @@ function isLogLevel(value: unknown): value is LogLevel {
 // ---------------------------------------------------------------------------
 
 /**
- * Run one incremental refresh with the given logger and cancellation. Exported
- * for tests; the entry guard below wires signals + the timeout and calls this.
+ * Run one incremental refresh that stops by `deadline` (epoch ms) and report
+ * how it ended. Exported for tests; the entry guard below wires signals and the
+ * deadline, then calls this.
  */
-export async function runRefreshChild(log: MirrorLogger, signal: AbortSignal): Promise<void> {
-  const result = await runHarvest({ log, signal }, { mode: 'refresh' });
-  log.info?.('Mirror refresh complete', { ...result });
+export async function runRefreshChild(
+  log: MirrorLogger,
+  signal: AbortSignal,
+  deadline: number,
+): Promise<FinishedOutcome> {
+  const { drained, ...counts } = await runHarvest({ log, signal }, { mode: 'refresh', deadline });
+  return { outcome: drained ? 'drained' : 'partial', ...counts };
+}
+
+/** One JSON object per line on stdout, for the parent to relay; `done` runs once it is written. */
+function emitLine(
+  level: LogLevel,
+  msg: string,
+  meta?: Readonly<Record<string, unknown>>,
+  done?: () => void,
+): void {
+  process.stdout.write(`${JSON.stringify({ level, msg, ...(meta ?? {}) })}\n`, done);
 }
 
 /** Logger that emits one JSON object per line on stdout for the parent to relay. */
 function makeChildLogger(): MirrorLogger {
-  const emit = (level: LogLevel, msg: string, meta?: Readonly<Record<string, unknown>>): void => {
-    process.stdout.write(`${JSON.stringify({ level, msg, ...(meta ?? {}) })}\n`);
-  };
   return {
-    debug: (m, meta) => emit('debug', m, meta),
-    info: (m, meta) => emit('info', m, meta),
-    notice: (m, meta) => emit('notice', m, meta),
-    warning: (m, meta) => emit('warning', m, meta),
-    error: (m, meta) => emit('error', m, meta),
+    debug: (m, meta) => emitLine('debug', m, meta),
+    info: (m, meta) => emitLine('info', m, meta),
+    notice: (m, meta) => emitLine('notice', m, meta),
+    warning: (m, meta) => emitLine('warning', m, meta),
+    error: (m, meta) => emitLine('error', m, meta),
   };
 }
 
@@ -238,22 +318,19 @@ if (isMainEntry()) {
       controller.abort(new Error(`Aborted by ${sig}`));
     });
   }
-  // Self-timeout for a standalone `mirror:refresh` invocation; when spawned by
-  // runRefreshSubprocess the parent's SIGTERM/SIGKILL watchdog also applies.
-  const timer = setTimeout(
-    () => controller.abort(new Error('Refresh timeout')),
-    getServerConfig().mirrorRefreshTimeoutMs,
-  );
-  runRefreshChild(log, controller.signal)
-    .then(() => {
-      clearTimeout(timer);
-      process.exit(0);
-    })
+  // The budget runs from this process's start, which trails the parent's spawn
+  // (and its SIGTERM timer) by only the exec itself.
+  const deadline = performance.timeOrigin + getServerConfig().mirrorRefreshTimeoutMs;
+  // Each exit waits for its last line to be written: stdout is a pipe, and the
+  // parent reads the outcome from it.
+  runRefreshChild(log, controller.signal, deadline)
+    .then((outcome) => emitLine('info', OUTCOME_MSG, outcome, () => process.exit(0)))
     .catch((err: unknown) => {
-      clearTimeout(timer);
-      log.error?.('Mirror refresh failed', {
-        error: err instanceof Error ? err.message : String(err),
-      });
-      process.exit(1);
+      emitLine(
+        'error',
+        'Mirror refresh failed',
+        { error: err instanceof Error ? err.message : String(err) },
+        () => process.exit(1),
+      );
     });
 }

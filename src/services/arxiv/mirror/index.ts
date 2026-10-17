@@ -12,6 +12,7 @@ export type { HarvestResult, ProgressCallback } from './runner.js';
 export { readHarvestStatus, runHarvest } from './runner.js';
 export {
   getStore,
+  MIRROR_SEARCH_MATCH_CAP,
   MirrorStore,
   normalizeDateToIso,
   openStore,

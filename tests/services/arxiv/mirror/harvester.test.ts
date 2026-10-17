@@ -6,8 +6,8 @@
  */
 
 import { McpError } from '@cyanheads/mcp-ts-core/errors';
-import { describe, expect, it } from 'vitest';
-import { parseListRecords } from '@/services/arxiv/mirror/harvester.js';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { harvestPages, parseListRecords } from '@/services/arxiv/mirror/harvester.js';
 
 const PAGE_WITH_TOKEN = `<?xml version="1.0" encoding="UTF-8"?>
 <OAI-PMH xmlns="http://www.openarchives.org/OAI/2.0/">
@@ -127,5 +127,74 @@ describe('parseListRecords', () => {
       expect((err as McpError).data?.code).toBe('badResumptionToken');
       expect((err as McpError).data?.reason).toBe('token_expired');
     }
+  });
+});
+
+describe('harvestPages — resumption-token expiry', () => {
+  const page = (datestamp: string, id: string, token?: string) =>
+    `<?xml version="1.0" encoding="UTF-8"?>
+<OAI-PMH xmlns="http://www.openarchives.org/OAI/2.0/"><ListRecords>
+  <record>
+    <header><identifier>oai:arXiv.org:${id}</identifier><datestamp>${datestamp}</datestamp></header>
+    <metadata><arXivRaw><id>${id}</id><title>T</title><authors>A</authors><categories>cs.LG</categories><abstract>X</abstract></arXivRaw></metadata>
+  </record>${token ? `<resumptionToken>${token}</resumptionToken>` : ''}
+</ListRecords></OAI-PMH>`;
+
+  const options = { baseUrl: 'https://oai.test/oai', requestDelayMs: 0, requestTimeoutMs: 1000 };
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  /** Drain the generator against queued responses; returns the requested URLs. */
+  async function run(from: string | undefined, startToken: string | undefined, bodies: string[]) {
+    const requests: URL[] = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: string) => {
+        requests.push(new URL(url));
+        const body = bodies.shift();
+        if (body === undefined) throw new Error(`unexpected fetch: ${url}`);
+        return new Response(body, { status: 200 });
+      }),
+    );
+    const stamps: string[] = [];
+    for await (const p of harvestPages(startToken, from, options, {
+      signal: new AbortController().signal,
+    })) {
+      for (const r of p.records) stamps.push(r.datestamp);
+    }
+    return { requests, stamps };
+  }
+
+  const positions = (requests: URL[]) =>
+    requests.map((u) => u.searchParams.get('resumptionToken') ?? u.searchParams.get('from'));
+
+  it('recovers from the latest datestamp it has yielded, not the run start', async () => {
+    const { requests, stamps } = await run('2026-06-01', undefined, [
+      page('2026-06-01', '2606.00001', 'tok-1'),
+      page('2026-06-03', '2606.00002', 'tok-2'),
+      BAD_TOKEN_PAGE,
+      page('2026-06-03', '2606.00002'),
+    ]);
+
+    expect(positions(requests)).toEqual(['2026-06-01', 'tok-1', 'tok-2', '2026-06-03']);
+    expect(requests[3]?.searchParams.get('metadataPrefix')).toBe('arXivRaw');
+    expect(stamps).toEqual(['2026-06-01', '2026-06-03', '2026-06-03']);
+  });
+
+  it('recovers a token-started run from its from datestamp before any page arrives', async () => {
+    const { requests } = await run('2026-06-04', 'saved-tok', [
+      BAD_TOKEN_PAGE,
+      page('2026-06-04', '2606.00003'),
+    ]);
+
+    expect(positions(requests)).toEqual(['saved-tok', '2026-06-04']);
+  });
+
+  it('rethrows an expired token when it has no datestamp to recover from', async () => {
+    await expect(run(undefined, 'saved-tok', [BAD_TOKEN_PAGE])).rejects.toThrow(
+      /badResumptionToken/,
+    );
   });
 });

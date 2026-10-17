@@ -517,6 +517,27 @@ describe('v2→v3 migration (#37)', () => {
     store.close();
   });
 
+  it('leaves the write-path index to the harvester: absent after the upgrade, added without a version bump (#50)', async () => {
+    await buildV2Db();
+    const indexes = async () => {
+      const { Database } = await import('bun:sqlite');
+      const db = new Database(dbPath, { readonly: true });
+      const rows = db.prepare(`PRAGMA index_list(paper_categories)`).all() as { name: string }[];
+      db.close();
+      return rows.map((r) => r.name);
+    };
+
+    const store = await MirrorStore.open(dbPath);
+    expect(store.schemaVersion().current).toBe(3);
+    expect(await indexes()).not.toContain('paper_categories_paper_id_idx');
+
+    store.ensureWriteIndex();
+    expect(await indexes()).toContain('paper_categories_paper_id_idx');
+    expect(store.schemaVersion().current).toBe(3);
+    expect(idsFor(store, 'journal_ref:"Nature"')).toEqual(['2101.00001']);
+    store.close();
+  });
+
   it('upgrades an empty mirror without touching harvest state', async () => {
     await buildV2Db([]);
     const store = await MirrorStore.open(dbPath);

@@ -25,7 +25,7 @@ await createApp({
   // horizontally. MCP_SESSION_MODE still overrides this when set. See issue #40.
   sessionMode: 'stateless',
   instructions:
-    'Use the arxiv_* tools to access the arXiv paper corpus: search by query, fetch metadata by ID, read full-text HTML, and list the subject category taxonomy. Papers are addressed by arXiv ID (e.g. 2401.12345 or 2401.12345v2 with version); search queries support field prefixes (ti:, au:, abs:, cat:) and boolean operators (AND, OR, ANDNOT).',
+    'Use the arxiv_* tools to access the arXiv paper corpus: search by query, fetch metadata by ID, read full paper text (an HTML render, or text extracted from the PDF), and list the subject category taxonomy. Papers are addressed by arXiv ID (e.g. 2401.12345, 2401.12345v2 with version, or hep-th/9901001 for pre-2007 papers); search queries support field prefixes (ti:, au:, abs:, co:, jr:, cat:, all:) and boolean operators (AND, OR, ANDNOT).',
   async setup(core) {
     initArxivService();
 
@@ -57,7 +57,10 @@ await createApp({
           };
           // Run the harvest in a child process so its synchronous SQLite writes
           // never block the request event loop — the server keeps serving
-          // arxiv_search / arxiv_get_metadata throughout. See issue #22.
+          // arxiv_search_papers / arxiv_get_metadata throughout. See issue #22.
+          // It logs the run's outcome (drained, or stopped at its deadline to
+          // resume on the next tick) and rejects only on a real failure, which
+          // the scheduler records as a failed job. See issues #31, #39.
           await runRefreshSubprocess({
             timeoutMs: serverConfig.mirrorRefreshTimeoutMs,
             log: mirrorLog,

@@ -32,6 +32,28 @@ export interface HarvesterOptions {
 }
 
 /**
+ * Retry policy for one page fetch. `maxDelayMs` is also the longest
+ * `Retry-After` a retry honors (a longer one fails the fetch at once), so it —
+ * not the exponential backoff — bounds each wait.
+ */
+const PAGE_RETRY = { maxRetries: 2, baseDelayMs: 5000, maxDelayMs: 30_000 } as const;
+
+/**
+ * Longest one page fetch can take before it settles: every attempt running to
+ * the request timeout, the longest wait between attempts, and the etiquette
+ * delay that precedes the next request. A harvest with a deadline reserves
+ * this much before it starts another page.
+ */
+export function worstCasePageFetchMs(options: HarvesterOptions): number {
+  const attempts = PAGE_RETRY.maxRetries + 1;
+  return (
+    attempts * options.requestTimeoutMs +
+    PAGE_RETRY.maxRetries * PAGE_RETRY.maxDelayMs +
+    options.requestDelayMs
+  );
+}
+
+/**
  * Pull one OAI `ListRecords` page. Returns parsed records, tombstones, and the
  * next resumption token (if any). Callers thread the token back in to continue.
  */
@@ -49,12 +71,7 @@ export function fetchListRecordsPage(
       const xml = await fetchOai(url, options.requestTimeoutMs, ctx.signal);
       return parseListRecords(xml);
     },
-    {
-      operation: 'arxivMirrorListRecords',
-      signal: ctx.signal,
-      maxRetries: 2,
-      baseDelayMs: 5000,
-    },
+    { operation: 'arxivMirrorListRecords', signal: ctx.signal, ...PAGE_RETRY },
   );
 }
 
@@ -64,8 +81,9 @@ export function fetchListRecordsPage(
  * resumption state.
  *
  * @param startToken - Resume from this token if provided.
- * @param from - Datestamp checkpoint (`YYYY-MM-DD`). Used both for incremental
- *   refresh and as recovery when a resumption token has expired.
+ * @param from - Datestamp checkpoint (`YYYY-MM-DD`). The start of an
+ *   incremental refresh, and the recovery point when a resumption token is
+ *   rejected before any page has arrived.
  */
 export async function* harvestPages(
   startToken: string | undefined,
@@ -78,6 +96,10 @@ export async function* harvestPages(
 ): AsyncGenerator<OaiPage> {
   let token: string | undefined = startToken;
   let useFrom: string | undefined = startToken ? undefined : from;
+  // Latest datestamp of a page the consumer has taken. The generator resumes
+  // only once the consumer has applied and checkpointed the page it yielded,
+  // so this matches the caller's persisted checkpoint.
+  let checkpoint: string | undefined = from;
   let pages = 0;
 
   // eslint-disable-next-line no-constant-condition
@@ -93,11 +115,14 @@ export async function* harvestPages(
       );
     } catch (err) {
       // Daily expiry recovery: token expired or invalid → restart from the
-      // last datestamp we observed.
-      if (isTokenExpiredError(err) && from) {
-        ctx.log?.warning?.('Resumption token expired; recovering from datestamp', { from });
+      // latest checkpointed datestamp. OAI `from` is inclusive and pages run in
+      // datestamp order, so nothing past the checkpoint is skipped.
+      if (isTokenExpiredError(err) && checkpoint) {
+        ctx.log?.warning?.('Resumption token expired; recovering from datestamp', {
+          from: checkpoint,
+        });
         token = undefined;
-        useFrom = from;
+        useFrom = checkpoint;
         continue;
       }
       throw err;
@@ -105,6 +130,9 @@ export async function* harvestPages(
 
     pages += 1;
     yield page;
+
+    const stamp = pickLatestDatestamp(page);
+    if (stamp && (!checkpoint || stamp > checkpoint)) checkpoint = stamp;
 
     if (!page.resumptionToken) return;
     token = page.resumptionToken;

@@ -127,3 +127,21 @@ CREATE TABLE IF NOT EXISTS harvest_state (
 
 INSERT OR IGNORE INTO harvest_state(id, status) VALUES (1, 'pending');
 `;
+
+/**
+ * Write-path index on `paper_categories(paper_id)` (issue #50). Every record
+ * write deletes the paper's junction rows by `paper_id`, and a tombstone's
+ * `ON DELETE CASCADE` looks them up the same way; neither existing index leads
+ * with `paper_id`, so without this one each lookup scans the whole junction.
+ *
+ * Kept out of {@link MIRROR_SCHEMA_SQL} on purpose: `MirrorStore.open` runs that
+ * DDL on every open, including the server's lazy first open on the request
+ * event loop, and building this index over a full-corpus junction takes
+ * seconds. The harvest runner — the only writer — ensures it before its first
+ * page instead (`MirrorStore.ensureWriteIndex`). Reads never filter the
+ * junction by `paper_id`, so a file without it serves identically, and the
+ * schema version does not change.
+ */
+export const MIRROR_WRITE_INDEX_SQL = `
+CREATE INDEX IF NOT EXISTS paper_categories_paper_id_idx ON paper_categories(paper_id);
+`;

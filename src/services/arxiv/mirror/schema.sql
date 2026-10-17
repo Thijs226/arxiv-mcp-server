@@ -1,5 +1,6 @@
 -- arxiv-mcp-server OAI-PMH mirror schema v3 (issues #18 + #19 + #37)
--- Created by SqliteAdapter.migrate(); kept under source control for review.
+-- Review copy of schema.ts, which MirrorStore.open executes (all but the
+-- write-path index at the end of the paper_categories section).
 
 PRAGMA journal_mode = WAL;
 PRAGMA synchronous = NORMAL;
@@ -92,6 +93,16 @@ CREATE TABLE IF NOT EXISTS paper_categories (
 -- scan, fast for common and rare categories alike (issue #19).
 CREATE INDEX IF NOT EXISTS paper_categories_cat_updated_idx
   ON paper_categories(category, updated);
+
+-- Write-path index (issue #50): each record write deletes the paper's junction
+-- rows by paper_id, and a tombstone's ON DELETE CASCADE looks them up the same
+-- way. Built by the harvest runner before its first page
+-- (MirrorStore.ensureWriteIndex), never by MirrorStore.open: over a
+-- full-corpus junction the build takes seconds, and open also runs on the
+-- server's request event loop. Reads never filter by paper_id. Not part of the
+-- schema version.
+CREATE INDEX IF NOT EXISTS paper_categories_paper_id_idx
+  ON paper_categories(paper_id);
 
 -- ---------------------------------------------------------------------------
 -- harvest_state — single-row table tracking init/refresh progress.

@@ -6,7 +6,12 @@
  */
 
 import { getServerConfig } from '@/config/server-config.js';
-import { type HarvesterOptions, harvestPages, pickLatestDatestamp } from './harvester.js';
+import {
+  type HarvesterOptions,
+  harvestPages,
+  pickLatestDatestamp,
+  worstCasePageFetchMs,
+} from './harvester.js';
 import { type MirrorStore, openStore } from './store.js';
 
 /**
@@ -31,6 +36,14 @@ export interface MirrorRunnerContext {
 
 /** Outcome of a harvest run. */
 export interface HarvestResult {
+  /**
+   * `true` when the OAI list ran out and `complete` was written; `false` when
+   * the run stopped at its deadline, leaving an `in_progress` checkpoint the
+   * next run resumes from.
+   */
+  drained: boolean;
+  /** Latest OAI datestamp applied so far (`YYYY-MM-DD`). */
+  lastDatestamp?: string | undefined;
   pagesFetched: number;
   recordsApplied: number;
   tombstonesApplied: number;
@@ -46,20 +59,33 @@ export type ProgressCallback = (info: {
 }) => void;
 
 /**
- * Run a harvest cycle. When called with no checkpoint, performs a full init;
- * when called after a previous successful run, performs an incremental refresh
- * starting from the last datestamp + 1 day (OAI `from` is inclusive).
+ * Run a harvest cycle.
  *
- * Persists `harvest_state` progress and final status. Safe to interrupt — a
- * subsequent run resumes from the persisted resumption token, or recovers
- * from the last datestamp when the token has expired.
+ * Where it starts: a previous run that stopped before draining (`in_progress`
+ * or `error` with a saved resumption token) resumes from that token, which
+ * carries the position inside its datestamp. Otherwise a refresh starts at
+ * `from=last_datestamp` (OAI `from` is inclusive, so the boundary day is
+ * re-read), and an init with no checkpoint harvests from the beginning. A
+ * rejected token falls back to the datestamp checkpoint inside the harvester.
+ *
+ * Before the first page it ensures the write-path index on
+ * `paper_categories(paper_id)` (issue #50).
+ *
+ * Persists `harvest_state` after every page; `complete` (with `completed_at`)
+ * is written only when the list drains. With `deadline`, the run stops after a
+ * whole page once one worst-case page cycle no longer fits before it, leaving
+ * the same checkpoint an interrupted run leaves (issue #39). A cancelled
+ * `ctx.signal` always ends the run as a failure, never as a deadline stop.
+ *
+ * @param options.deadline - Epoch ms the run must have ended by.
  */
 export async function runHarvest(
   ctx: MirrorRunnerContext,
-  options: { mode: 'init' | 'refresh'; onProgress?: ProgressCallback },
+  options: { deadline?: number; mode: 'init' | 'refresh'; onProgress?: ProgressCallback },
 ): Promise<HarvestResult> {
   const config = getServerConfig();
   const store = await openStore(config.mirrorPath);
+  store.ensureWriteIndex();
   const existing = store.readHarvestState();
 
   const harvestOptions: HarvesterOptions = {
@@ -68,18 +94,14 @@ export async function runHarvest(
     requestTimeoutMs: config.apiTimeoutMs,
   };
 
-  const isResuming = options.mode === 'init' && existing.status === 'in_progress';
-  const startToken = isResuming ? existing.resumption_token : undefined;
-  const from =
-    options.mode === 'refresh' && existing.last_datestamp
-      ? existing.last_datestamp
-      : isResuming
-        ? existing.last_datestamp
-        : undefined;
+  const interrupted = existing.status === 'in_progress' || existing.status === 'error';
+  const startToken = interrupted ? existing.resumption_token : undefined;
+  const from = options.mode === 'refresh' || interrupted ? existing.last_datestamp : undefined;
+  const startedAt = new Date().toISOString();
 
   store.writeHarvestState({
     status: 'in_progress',
-    started_at: new Date().toISOString(),
+    started_at: startedAt,
     last_datestamp: existing.last_datestamp,
     resumption_token: startToken,
   });
@@ -89,10 +111,16 @@ export async function runHarvest(
   let tombstonesApplied = 0;
   let lastDatestamp: string | undefined = existing.last_datestamp;
   let lastToken: string | undefined = startToken;
+  let drained = true;
+  // One page cycle: the fetch at its worst plus the slowest apply seen so far.
+  const fetchReserveMs = worstCasePageFetchMs(harvestOptions);
+  let slowestApplyMs = 0;
 
   try {
     for await (const page of harvestPages(startToken, from, harvestOptions, ctx)) {
+      const applyStart = performance.now();
       store.applyBatch(page.records, page.tombstones);
+      slowestApplyMs = Math.max(slowestApplyMs, performance.now() - applyStart);
       pagesFetched += 1;
       recordsApplied += page.records.length;
       tombstonesApplied += page.tombstones.length;
@@ -103,7 +131,7 @@ export async function runHarvest(
 
       store.writeHarvestState({
         status: 'in_progress',
-        started_at: existing.started_at ?? new Date().toISOString(),
+        started_at: startedAt,
         last_datestamp: lastDatestamp,
         resumption_token: lastToken,
       });
@@ -114,23 +142,43 @@ export async function runHarvest(
         tombstones: tombstonesApplied,
         lastDatestamp,
       });
+
+      // A signal that fired during the synchronous apply is only seen here.
+      ctx.signal.throwIfAborted();
+      if (
+        lastToken &&
+        options.deadline !== undefined &&
+        Date.now() + fetchReserveMs + slowestApplyMs > options.deadline
+      ) {
+        drained = false;
+        break;
+      }
     }
 
     const totalRecords = store.countPapers();
-    store.writeHarvestState({
-      status: 'complete',
-      started_at: existing.started_at,
-      last_datestamp: lastDatestamp,
-      completed_at: new Date().toISOString(),
-      total_records: totalRecords,
-    });
+    if (drained) {
+      store.writeHarvestState({
+        status: 'complete',
+        started_at: startedAt,
+        last_datestamp: lastDatestamp,
+        completed_at: new Date().toISOString(),
+        total_records: totalRecords,
+      });
+    }
 
-    return { pagesFetched, recordsApplied, tombstonesApplied, totalRecords };
+    return {
+      drained,
+      lastDatestamp,
+      pagesFetched,
+      recordsApplied,
+      tombstonesApplied,
+      totalRecords,
+    };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     store.writeHarvestState({
       status: 'error',
-      started_at: existing.started_at,
+      started_at: startedAt,
       last_datestamp: lastDatestamp,
       resumption_token: lastToken,
       error_message: message,
