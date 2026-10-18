@@ -17,6 +17,7 @@ import {
   getArxivService,
   initArxivService,
   isConversionFailurePage,
+  isIncludedPdfPage,
   resolveRelativeUrls,
   stripHtmlHead,
   stripLatexmlNoise,
@@ -1650,6 +1651,135 @@ describe('ArxivService.readContent', () => {
     });
   });
 
+  // Include-PDF placeholders are not paper content (issue #57).
+  const INCLUDED_PDF =
+    '<p class="ltx_p">See pages 1-last of <a href="https://0_adam_main.pdf" class="ltx_ref">0_adam_main.pdf</a></p>';
+
+  it('falls through the captured include-PDF page on both HTML rungs to the versioned PDF', async () => {
+    mockFetch
+      .mockResolvedValueOnce(atomResponse(atomFor('1412.6980v9')))
+      .mockResolvedValueOnce(htmlResponse(fixturePage('native-1412.6980v9')))
+      .mockResolvedValueOnce(htmlResponse(fixturePage('native-1412.6980v9')))
+      .mockResolvedValueOnce(pdfResponse('Adam: A Method for Stochastic Optimization'));
+
+    const result = await getArxivService().readContent('1412.6980v9', {}, createMockContext());
+
+    expect(result.source).toBe('pdf_text');
+    expect(result.content).toBe('Adam: A Method for Stochastic Optimization');
+    expect(result.paper_id).toBe('1412.6980v9');
+    expect(result.outline).toEqual([]);
+    expect(mockFetch.mock.calls.slice(1).map(([url]) => url)).toEqual([
+      'https://arxiv.org/html/1412.6980v9',
+      'https://ar5iv.labs.arxiv.org/html/1412.6980v9',
+      'https://arxiv.org/pdf/1412.6980v9',
+    ]);
+  });
+
+  it('serves a real ar5iv render after a native include-PDF placeholder', async () => {
+    mockFetch
+      .mockResolvedValueOnce(atomResponse(ATOM_SINGLE))
+      .mockResolvedValueOnce(htmlResponse(`<article>${INCLUDED_PDF}</article>`))
+      .mockResolvedValueOnce(htmlResponse('<article><p>Readable body.</p></article>'));
+
+    const result = await getArxivService().readContent('2401.12345', {}, createMockContext());
+
+    expect(result.source).toBe('ar5iv');
+    expect(result.content).toContain('Readable body.');
+    expect(mockFetch).toHaveBeenCalledTimes(3);
+  });
+
+  it.each([
+    ['without a pages option', '<p>See <a href="paper.pdf" class="ltx_ref">paper.pdf</a></p>'],
+    ['multiple included PDFs', `${INCLUDED_PDF}<div>${INCLUDED_PDF}</div>`],
+    ['a page selection', '<p>See pages 1, 3-5 of <a href="paper.pdf">paper.pdf</a></p>'],
+  ])('falls through an ar5iv include-PDF placeholder %s', async (_name, body) => {
+    serveAr5ivPage(`<article>${body}</article>`);
+    mockFetch.mockResolvedValueOnce(pdfResponse('Readable PDF body.'));
+
+    const result = await getArxivService().readContent('hep-th/9711200v3', {}, createMockContext());
+
+    expect(result.source).toBe('pdf_text');
+    expect(result.content).toBe('Readable PDF body.');
+  });
+
+  it.each(['arxiv_html', 'ar5iv'] as const)(
+    'preserves short text, partial renders, ordinary PDF references and media on %s',
+    async (rung) => {
+      for (const body of [
+        '<p>Short paper.</p>',
+        '<p>See pages 1-last of paper.pdf</p>',
+        '<p>See <a href="paper.pdf">the accompanying PDF</a></p>',
+        '<p>See pages 1-last of <a href="paper.pdf">paper.pdf</a> for details.</p>',
+        `${INCLUDED_PDF}<p>Partial body.</p>`,
+        `${INCLUDED_PDF}<img src="figure.png">`,
+        `${INCLUDED_PDF}<math alttext="x"><mi>x</mi></math>`,
+        `${INCLUDED_PDF}<svg><path d="M0 0"></path></svg>`,
+        `${INCLUDED_PDF}<object data="figure.pdf"></object>`,
+      ]) {
+        mockFetch.mockReset();
+        mockFetch.mockResolvedValueOnce(atomResponse(ATOM_SINGLE));
+        if (rung === 'ar5iv') {
+          mockFetch.mockResolvedValueOnce(new Response('Not Found', { status: 404 }));
+        }
+        mockFetch.mockResolvedValueOnce(htmlResponse(`<article>${body}</article>`));
+
+        const result = await getArxivService().readContent('2401.12345', {}, createMockContext());
+
+        expect(result.source, body).toBe(rung);
+        expect(mockFetch).toHaveBeenCalledTimes(rung === 'arxiv_html' ? 2 : 3);
+      }
+    },
+  );
+
+  it.each([
+    ['content_unavailable', () => new Response('Not Found', { status: 404 })],
+    ['pdf_extraction_failed', () => pdfResponse('')],
+  ])('reports %s after include-PDF placeholders', async (reason, pdf) => {
+    mockFetch
+      .mockResolvedValueOnce(atomResponse(ATOM_SINGLE))
+      .mockResolvedValueOnce(htmlResponse(`<article>${INCLUDED_PDF}</article>`))
+      .mockResolvedValueOnce(htmlResponse(`<article>${INCLUDED_PDF}</article>`))
+      .mockResolvedValueOnce(pdf());
+
+    await expect(
+      getArxivService().readContent('2401.12345', {}, createMockContext()),
+    ).rejects.toMatchObject({ code: JsonRpcErrorCode.NotFound, data: { reason } });
+  });
+
+  it('preserves an ar5iv timeout after an include-PDF placeholder when the PDF is absent', async () => {
+    mockFetch
+      .mockResolvedValueOnce(atomResponse(ATOM_SINGLE))
+      .mockResolvedValueOnce(htmlResponse(`<article>${INCLUDED_PDF}</article>`))
+      .mockRejectedValueOnce(new DOMException('Timed out', 'TimeoutError'))
+      .mockResolvedValueOnce(new Response('Not Found', { status: 404 }));
+
+    await expect(
+      getArxivService().readContent('2401.12345', {}, createMockContext()),
+    ).rejects.toMatchObject({ code: JsonRpcErrorCode.Timeout });
+    expect(mockFetch).toHaveBeenCalledTimes(4);
+  });
+
+  it('stops on caller cancellation after an include-PDF placeholder', async () => {
+    const controller = new AbortController();
+    const aborted = new DOMException('Cancelled', 'AbortError');
+    mockFetch
+      .mockResolvedValueOnce(atomResponse(ATOM_SINGLE))
+      .mockResolvedValueOnce(htmlResponse(`<article>${INCLUDED_PDF}</article>`))
+      .mockImplementationOnce(async () => {
+        controller.abort(aborted);
+        throw aborted;
+      });
+
+    await expect(
+      getArxivService().readContent(
+        '2401.12345',
+        {},
+        createMockContext({ signal: controller.signal }),
+      ),
+    ).rejects.toThrow();
+    expect(mockFetch).toHaveBeenCalledTimes(3);
+  });
+
   // -------------------------------------------------------------------------
   // Unbounded reads (issue #24)
   // -------------------------------------------------------------------------
@@ -2310,6 +2440,17 @@ describe('HTML cleaning passes', { timeout: 30_000 }, () => {
   it('keeps the alttext read linear in page length', () => {
     expectLinear('alttext=x ', (s) => collapseMathML(`<math ${s}></math>`));
     expectLinear('alttext="x ', (s) => collapseMathML(`<math ${s}></math>`));
+  });
+});
+
+describe('isIncludedPdfPage', { timeout: 30_000 }, () => {
+  it('keeps the include-PDF check linear for repeated incomplete markup and page selections', () => {
+    for (const unit of ['<p ', '<p>See ', '<p>See <a ', '<p>See <a>', '<div ']) {
+      expectLinear(unit, (s) => isIncludedPdfPage(`<article>${s}</article>`));
+    }
+    expectLinear('1, ', (s) =>
+      isIncludedPdfPage(`<article><p>See pages ${s} of <a>x.pdf</a></p></article>`),
+    );
   });
 });
 

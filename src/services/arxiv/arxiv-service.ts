@@ -268,6 +268,33 @@ export function isConversionFailurePage(html: string): boolean {
 }
 
 /**
+ * LaTeXML's pdfpages binding emits only "See [pages ... of] <a>file.pdf</a>"
+ * when it cannot render an included PDF. Reject a page made entirely of those
+ * paragraphs, on either HTML rung, but keep partial text and non-text content.
+ * Only container tags are ignored: an image, math, or embedded object is still
+ * a render. Each tag/text scan stops at the next `<`, keeping the pass linear.
+ * See issue #57 and LaTeXML/Package/pdfpages.sty.ltxml.
+ */
+export function isIncludedPdfPage(html: string): boolean {
+  if (!html.includes('See')) return false;
+  let found = false;
+  const remaining = stripHtmlHead(html)
+    .replace(
+      /<p\b[^<>]*>([^<]*)<a\b[^<>]*>([^<>]*)<\/a>\s*<\/p>/gi,
+      (paragraph, prefix: string, label: string) => {
+        const text = prefix.replace(/\s+/g, ' ').trim();
+        if (!/^See(?: pages [\d,last{} -]+ of)?$/.test(text) || !/\.pdf$/i.test(label.trim())) {
+          return paragraph;
+        }
+        found = true;
+        return '';
+      },
+    )
+    .replace(/<\/?(?:article|div)\b[^<>]*>/gi, '');
+  return found && !/\S/.test(remaining);
+}
+
+/**
  * Class tokens that mark document structure (sections, headings, bibliography,
  * abstract, etc.). The `ltx_*` classes generally carry no information a reader
  * benefits from, but these specific tokens identify section boundaries: the
@@ -1403,11 +1430,11 @@ export class ArxivService {
         throw serviceUnavailable('arxiv.org HTML network error', { paperId }, { cause: err });
       }
       if (response.ok) {
-        return {
-          content: await response.text(),
-          source: 'arxiv_html',
-          url: response.url || url,
-        };
+        const content = await response.text();
+        if (!isIncludedPdfPage(content)) {
+          return { content, source: 'arxiv_html', url: response.url || url };
+        }
+        ctx.log.debug('arxiv.org served an include-PDF placeholder; trying ar5iv', { paperId });
       }
       if (response.status >= 500) {
         // Override 500/501 to ServiceUnavailable so withRetry retries them.
@@ -1417,7 +1444,7 @@ export class ArxivService {
             s >= 500 && s < 600 ? JsonRpcErrorCode.ServiceUnavailable : undefined,
         });
       }
-      // 404 or other 4xx → fall through to ar5iv
+      // 404, other 4xx, or an include-PDF placeholder → fall through to ar5iv
     }
 
     /**
@@ -1457,10 +1484,10 @@ export class ArxivService {
       }
       if (response?.ok) {
         const content = await response.text();
-        if (!isConversionFailurePage(content)) {
+        if (!isConversionFailurePage(content) && !isIncludedPdfPage(content)) {
           return { content, source: 'ar5iv', url: response.url || url };
         }
-        ctx.log.debug('ar5iv served a conversion-failure page; trying the PDF', { paperId });
+        ctx.log.debug('ar5iv served no readable HTML content; trying the PDF', { paperId });
       }
       if (response !== undefined && response.status >= 500) {
         ar5ivFailure = await httpErrorFromResponse(response, {
@@ -1469,7 +1496,7 @@ export class ArxivService {
             s >= 500 && s < 600 ? JsonRpcErrorCode.ServiceUnavailable : undefined,
         });
       }
-      // 3xx, 4xx, or a 200 conversion-failure page → not converted. On to the PDF.
+      // 3xx, 4xx, or a 200 failure/placeholder page → no render. On to the PDF.
     }
 
     // Last rung: the PDF, extracted to plain text.
